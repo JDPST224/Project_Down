@@ -173,7 +173,7 @@ func main() {
 	}
 	agentID := ip
 
-	controlServerURL := "http://localhost:8080"
+	controlServerURL := "https://urban-winner-69q4vqqpw62r5jx-8080.app.github.dev:8080"
 	fmt.Printf("[AGENT] %s starting; polling %s\n", agentID, controlServerURL)
 
 	// 2) Let the control server know we exist (initial “Ready”):
