@@ -220,7 +220,7 @@ func main() {
 	go watchForOfflineAgents()
 
 	fmt.Println("[CONTROL] Listening at http://localhost:8080")
-	if err := http.ListenAndServe("https://urban-winner-69q4vqqpw62r5jx-8080.app.github.dev:8080", nil); err != nil {
+	if err := http.ListenAndServe(":8080", nil); err != nil {
 		fmt.Printf("[CONTROL] ListenAndServe error: %v\n", err)
 	}
 }
