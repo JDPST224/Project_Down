@@ -129,8 +129,6 @@ func pollControlServer(controlURL, agentID string) {
 		default:
 			// Unknown action → ignore
 		}
-
-		time.Sleep(1 * time.Second)
 	}
 }
 
