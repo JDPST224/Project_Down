@@ -502,7 +502,7 @@ func main() {
 	srv := &http.Server{
 		Addr:         *listenAddr,
 		Handler:      mux,
-		ReadTimeout:  5 * time.Second,
+		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 0,
 		// <<< Disable HTTP/2 so SSE stays on HTTP/1.1 >>>
 		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
