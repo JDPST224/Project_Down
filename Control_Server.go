@@ -153,7 +153,7 @@ func (s *Store) sseHandler(w http.ResponseWriter, r *http.Request) {
 	// Send initial comment to confirm connection
 	fmt.Fprintf(w, ": connected\n\n")
 	fl.Flush()
-	pingTicker := time.NewTicker(500 * time.Microsecond)
+	pingTicker := time.NewTicker(1 * time.Second)
 	defer pingTicker.Stop()
 
 	go func() {
