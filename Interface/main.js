@@ -71,13 +71,11 @@ function onAgentStatusChanged(payload) {
 }
 
 // Called whenever we receive a "command-enqueued" event.
-// (We currently do not display pending commands in the table, 
-// so this is just logged. You can expand this if needed.)
+// Currently we only log it; you can extend to show it in the UI if desired.
 function onCommandEnqueued(payload) {
-  // payload: { agentID: "...", command: { Action, URL, Threads, Timer, CustomHost } }
+  // payload: { agentID: "1.2.3.4", command: { Action, URL, Threads, Timer, CustomHost } }
   console.log("Command enqueued for agent:", payload.agentID, payload.command);
-  // If you want to highlight it in the UI, you could add a new <td> 
-  // or add a CSS class—omitted here for brevity.
+  // If desired, add code here to highlight the agent’s row, show a badge, etc.
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -85,7 +83,7 @@ document.addEventListener("DOMContentLoaded", () => {
   fetch("/agent-statuses")
     .then((res) => res.json())
     .then((allStatuses) => {
-      // allStatuses is an object: { agentID: { Online, Status, LastPing }, ... }
+      // allStatuses is an object: { "1.2.3.4": { Online, Status, LastPing }, ... }
       for (const [agentID, info] of Object.entries(allStatuses)) {
         onAgentStatusChanged({ agentID: agentID, status: info });
       }
@@ -94,7 +92,7 @@ document.addEventListener("DOMContentLoaded", () => {
       console.warn("Could not fetch initial agent-statuses:", err);
     });
 
-  // 2) Open a long‐lived SSE connection:
+  // 2) Open a long‐lived SSE connection to /events (no ?agentID)
   const evtSource = new EventSource("/events");
 
   evtSource.addEventListener("agent-status-changed", (ev) => {
@@ -109,7 +107,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
   evtSource.onerror = (err) => {
     console.error("SSE error:", err);
-    // Optionally, you can try to reconnect after a delay:
-    // setTimeout(() => window.location.reload(), 5000);
+    // Optionally: retry logic or show a banner.
   };
 });
