@@ -8,28 +8,41 @@
 </head>
 <body>
   <div class="main-container">
-    <h1>Control Server</h1>
+    <h1 class="title">Control Server</h1>
 
     <!-- Form to send a “Start” command to all agents -->
-    <div class="container">
+    <div class="container form-container">
       <form method="POST" action="/command">
-        <article>
-          <input type="text" name="url" placeholder="Target URL" required />
-          <input type="number" name="threads" placeholder="Threads" required />
-          <input type="number" name="timer" placeholder="Timer (seconds)" required />
-          <button class="Start_button" type="submit">Start</button>
+        <article class="card">
+          <label for="url">Target URL</label>
+          <input id="url" type="text" name="url" placeholder="https://example.com" required />
+          
+          <label for="threads">Threads</label>
+          <input id="threads" type="number" name="threads" placeholder="Number of Threads" required />
+
+          <label for="timer">Timer (seconds)</label>
+          <input id="timer" type="number" name="timer" placeholder="Duration" required />
+
+          <button class="btn btn-primary" type="submit">Start</button>
         </article>
-        <article>
+
+        <article class="card">
           <h2>Custom Header</h2>
-          <input type="text" name="custom_host" placeholder="Custom Host (optional)" />
+          <label for="custom_host">Custom Host (optional)</label>
+          <input id="custom_host" type="text" name="custom_host" placeholder="e.g., custom.example.com" />
         </article>
       </form>
     </div>
 
-    <!-- Agent Status Table -->
-    <div class="container">
-      <div class="topc">
-        <h2>-- Agent Status --</h2>
+    <!-- Agent Status Section -->
+    <div class="container status-container">
+      <div class="status-header">
+        <h2>Agent Status</h2>
+        <div class="agent-count">
+          <span id="blinkDot" class="blink-dot"></span>
+          Online Agents: 
+          <span id="onlineCount">0</span>
+        </div>
       </div>
       <div class="scroller">
         <table>
@@ -49,7 +62,7 @@
     </div>
   </div>
 
-  <!-- Include the updated main.js -->
+  <!-- Updated main.js -->
   <script type="text/javascript" src="/Interface/main.js"></script>
 </body>
 </html>
