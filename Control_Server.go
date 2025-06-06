@@ -157,7 +157,7 @@ func (s *Store) sseHandler(w http.ResponseWriter, r *http.Request) {
 
 	// --------------------------------------------------------------------
 	// Send a keep‐alive comment every 5s so proxies or the server won't close.
-	pingTicker := time.NewTicker(5 * time.Second)
+	pingTicker := time.NewTicker(2 * time.Second)
 	defer pingTicker.Stop()
 
 	go func() {
@@ -502,7 +502,7 @@ func main() {
 	srv := &http.Server{
 		Addr:         *listenAddr,
 		Handler:      mux,
-		ReadTimeout:  10 * time.Second,
+		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 0,
 		// <<< Disable HTTP/2 so SSE stays on HTTP/1.1 >>>
 		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
