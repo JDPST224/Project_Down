@@ -18,21 +18,22 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
-	"encoding/json"
-	"flag"
-	"fmt"
-	"io/ioutil"
-	"log"
-	"net/http"
-	"os"
-	"os/exec"
-	"os/signal"
-	"strings"
-	"sync"
-	"syscall"
-	"time"
+    "bufio"
+    "bytes"
+    "crypto/tls"
+    "encoding/json"
+    "flag"
+    "fmt"
+    "io/ioutil"
+    "log"
+    "net/http"
+    "os"
+    "os/exec"
+    "os/signal"
+    "strings"
+    "sync"
+    "syscall"
+    "time"
 )
 
 // Command represents a control instruction from the server.
@@ -45,19 +46,27 @@ type Command struct {
 }
 
 var (
-	mu             sync.Mutex
-	currentCommand *exec.Cmd
-	status         = "Ready"
+    mu             sync.Mutex
+    currentCommand *exec.Cmd
+    status         = "Ready"
 
-	// HTTP client for short‐lived requests (POST /agent-status, GET public IP, etc.)
-	httpClient = &http.Client{
-		Timeout: 10 * time.Second,
-	}
+    // Create a Transport that disables HTTP/2
+    noHTTP2Transport = &http.Transport{
+        TLSClientConfig:   &tls.Config{InsecureSkipVerify: false},
+        ForceAttemptHTTP2: false, // <— do not attempt HTTP/2
+    }
 
-	// SSE client for “long‐poll” GET /events; no timeout so it can block indefinitely
-	sseClient = &http.Client{
-		// no Timeout field → defaults to no timeout
-	}
+    // httpClient for short‐lived requests (agent‐status, getPublicIP)
+    httpClient = &http.Client{
+        Timeout:   10 * time.Second,
+        Transport: noHTTP2Transport,
+    }
+
+    // sseClient for the SSE “long‐poll” /events; also force HTTP/1.1
+    sseClient = &http.Client{
+        Transport: noHTTP2Transport,
+        // Note: no Timeout here, so reads can block indefinitely
+    }
 )
 
 func init() {
