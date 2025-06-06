@@ -17,20 +17,22 @@
 package main
 
 import (
-	"context"
-	"encoding/json"
-	"flag"
-	"fmt"
-	"log"
-	"net/http"
-	"os"
-	"os/signal"
-	"strconv"
-	"strings"
-	"sync"
-	"syscall"
-	"time"
+    "context"
+    "crypto/tls"
+    "encoding/json"
+    "flag"
+    "fmt"
+    "log"
+    "net/http"
+    "os"
+    "os/signal"
+    "strconv"
+    "strings"
+    "sync"
+    "syscall"
+    "time"
 )
+
 
 //
 // ─── MODELS & GLOBAL STORE ───────────────────────────────────────────────────
@@ -462,7 +464,7 @@ func renderInterface(w http.ResponseWriter, r *http.Request) {
 func main() {
 	// Parse flags
 	listenAddr := flag.String("addr", ":8080", "HTTP listen address (e.g. :8080)")
-	offlineDelay := flag.Duration("offline-timeout", 3*time.Second, "duration to mark agents offline if no heartbeat")
+	offlineDelay := flag.Duration("offline-timeout", 5*time.Second, "duration to mark agents offline if no heartbeat")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -502,6 +504,8 @@ func main() {
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 0,
+		// <<< Disable HTTP/2 so SSE stays on HTTP/1.1 >>>
+		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 		IdleTimeout:  60 * time.Second,
 	}
 
