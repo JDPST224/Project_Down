@@ -1,19 +1,3 @@
-// ControlServer.go
-//
-// A single‐file implementation of a Control Server that:
-// 1. Uses separate mutexes to avoid contention.
-// 2. Employs Server‐Sent Events (SSE) for real‐time command delivery.
-// 3. Maintains per‐agent command queues so no command is lost.
-// 4. Gracefully shuts down on SIGINT/SIGTERM.
-// 5. Marks agents offline if they don’t post heartbeats within a timeout.
-// 6. Broadcasts “command-enqueued” as raw Command JSON (for agents), and “agent-status-changed” wrapped with agentID (for UI).
-//
-// To build and run:
-//   go build -o controlserver ControlServer.go
-//   ./controlserver
-//
-// The default listen address is :8080. Override via -addr if needed.
-
 package main
 
 import (
@@ -50,7 +34,7 @@ type Command struct {
 type AgentStatus struct {
 	Online   bool   `json:"Online"`   // true if agent is considered online
 	Status   string `json:"Status"`   // e.g. "Ready", "Sending", "Error"
-	LastPing string `json:"LastPing"` // RFC3339 timestamp of last heartbeat
+	LastPing string `json:"LastPing"` // RFC3339 timestamp of last heartbeat (UTC)
 }
 
 // eventPayload represents a message to send via SSE.
@@ -70,9 +54,9 @@ type Store struct {
 	cmdsMu  sync.Mutex
 	pending map[string][]Command
 
-	// Current status of each agent
-	statusMu sync.Mutex
-	statuses map[string]*AgentStatus
+	// Current status of each agent (use RWMutex for frequent reads)
+	statusMu   sync.RWMutex
+	statuses   map[string]*AgentStatus
 
 	// SSE clients: map[clientID]*sseClient
 	sseMu      sync.Mutex
@@ -120,7 +104,7 @@ func methodNotAllowed(w http.ResponseWriter) {
 
 // sseHandler upgrades an HTTP GET to an SSE connection.
 // If a non‐empty ?agentID is provided, that client only gets its own events.
-// If agentID="" (no query param), treat it as a “UI subscriber” => gets everything.
+// If agentID="" (no query param), treat it as a “UI subscriber” → gets everything.
 func (s *Store) sseHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w)
@@ -150,10 +134,13 @@ func (s *Store) sseHandler(w http.ResponseWriter, r *http.Request) {
 	s.sseClients[clientID] = client
 	s.sseMu.Unlock()
 
-	// Send initial comment to confirm connection
+	// Send initial comment and retry‐directive to confirm connection
 	fmt.Fprintf(w, ": connected\n\n")
+	fmt.Fprintf(w, "retry: 2000\n\n") // instruct client to retry in 2 s if disconnected
 	fl.Flush()
-	pingTicker := time.NewTicker(1 * time.Second)
+
+	// Send a keep‐alive comment every 250 ms so that proxies don't drop the connection
+	pingTicker := time.NewTicker(250 * time.Millisecond)
 	defer pingTicker.Stop()
 
 	go func() {
@@ -162,12 +149,14 @@ func (s *Store) sseHandler(w http.ResponseWriter, r *http.Request) {
 			case <-r.Context().Done():
 				return
 			case <-pingTicker.C:
-				fmt.Fprintf(w, ": ping\n\n")
-				fl.Flush()
+				func() {
+					defer func() { recover() }()
+					fmt.Fprintf(w, ": ping\n\n")
+					fl.Flush()
+				}()
 			}
 		}
 	}()
-	// --------------------------------------------------------------------
 
 	// Block until client disconnects
 	<-r.Context().Done()
@@ -187,7 +176,7 @@ func (s *Store) runSSEBroker(events <-chan eventPayload) {
 			// ev.Data is a Command. We send raw JSON so the agent can unmarshal into Command.
 			rawCmd, err := json.Marshal(ev.Data)
 			if err != nil {
-				continue // skip if invalid
+				continue
 			}
 
 			s.sseMu.Lock()
@@ -198,9 +187,12 @@ func (s *Store) runSSEBroker(events <-chan eventPayload) {
 				if client.agentID != ev.AgentID {
 					continue
 				}
-				fmt.Fprintf(client.writer, "event: %s\n", ev.Name)
-				fmt.Fprintf(client.writer, "data: %s\n\n", rawCmd)
-				client.flusher.Flush()
+				func() {
+					defer func() { recover() }()
+					fmt.Fprintf(client.writer, "event: %s\n", ev.Name)
+					fmt.Fprintf(client.writer, "data: %s\n\n", rawCmd)
+					client.flusher.Flush()
+				}()
 			}
 			s.sseMu.Unlock()
 
@@ -223,9 +215,12 @@ func (s *Store) runSSEBroker(events <-chan eventPayload) {
 				if client.agentID != ev.AgentID && client.agentID != "" {
 					continue
 				}
-				fmt.Fprintf(client.writer, "event: %s\n", ev.Name)
-				fmt.Fprintf(client.writer, "data: %s\n\n", wrappedBytes)
-				client.flusher.Flush()
+				func() {
+					defer func() { recover() }()
+					fmt.Fprintf(client.writer, "event: %s\n", ev.Name)
+					fmt.Fprintf(client.writer, "data: %s\n\n", wrappedBytes)
+					client.flusher.Flush()
+				}()
 			}
 			s.sseMu.Unlock()
 
@@ -242,11 +237,13 @@ func (s *Store) runSSEBroker(events <-chan eventPayload) {
 // runOfflineWatcher periodically scans all agents’ LastPing timestamps.
 // If any agent hasn’t pinged within offlineTimeout, mark it offline and broadcast.
 func (s *Store) runOfflineWatcher(offlineTimeout time.Duration, events chan<- eventPayload) {
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(1 * time.Second) // check once per second
 	defer ticker.Stop()
 
 	for range ticker.C {
-		cutoff := time.Now().Add(-offlineTimeout)
+		cutoff := time.Now().UTC().Add(-offlineTimeout)
+		var toBroadcast []eventPayload
+
 		s.statusMu.Lock()
 		for agentID, st := range s.statuses {
 			last, err := time.Parse(time.RFC3339, st.LastPing)
@@ -255,27 +252,31 @@ func (s *Store) runOfflineWatcher(offlineTimeout time.Duration, events chan<- ev
 				if st.Online {
 					st.Online = false
 					st.Status = ""
-					events <- eventPayload{
+					toBroadcast = append(toBroadcast, eventPayload{
 						AgentID: agentID,
 						Name:    "agent-status-changed",
 						Data:    *st,
-					}
-					log.Printf("[CONTROL] Marked %s OFFLINE (invalid timestamp)\n", agentID)
+					})
 				}
 				continue
 			}
 			if last.Before(cutoff) && st.Online {
 				st.Online = false
 				st.Status = ""
-				events <- eventPayload{
+				toBroadcast = append(toBroadcast, eventPayload{
 					AgentID: agentID,
 					Name:    "agent-status-changed",
 					Data:    *st,
-				}
-				log.Printf("[CONTROL] Marked %s OFFLINE (last ping %s)\n", agentID, st.LastPing)
+				})
 			}
 		}
 		s.statusMu.Unlock()
+
+		// Broadcast changes (outside the lock)
+		for _, ev := range toBroadcast {
+			events <- ev
+			log.Printf("[CONTROL] Marked %s OFFLINE (last ping %s)\n", ev.AgentID, ev.Data.(AgentStatus).LastPing)
+		}
 	}
 }
 
@@ -350,7 +351,7 @@ func (s *Store) agentPollHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	now := time.Now().Format(time.RFC3339)
+	now := time.Now().UTC().Format(time.RFC3339)
 
 	// Register agent and update LastPing
 	s.agentsMu.Lock()
@@ -403,7 +404,7 @@ func (s *Store) agentStatusHandler(events chan<- eventPayload) http.HandlerFunc 
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
 			return
 		}
-		now := time.Now().Format(time.RFC3339)
+		now := time.Now().UTC().Format(time.RFC3339)
 
 		s.statusMu.Lock()
 		entry, exists := s.statuses[payload.AgentID]
@@ -433,8 +434,8 @@ func (s *Store) agentStatusHandler(events chan<- eventPayload) http.HandlerFunc 
 // listAgentStatuses returns a JSON map[agentID]AgentStatus.
 // Offline agents appear with Online:false and empty Status.
 func (s *Store) listAgentStatuses(w http.ResponseWriter, r *http.Request) {
-	s.statusMu.Lock()
-	defer s.statusMu.Unlock()
+	s.statusMu.RLock()
+	defer s.statusMu.RUnlock()
 
 	out := make(map[string]AgentStatus, len(s.statuses))
 	for id, st := range s.statuses {
@@ -460,7 +461,7 @@ func renderInterface(w http.ResponseWriter, r *http.Request) {
 func main() {
 	// Parse flags
 	listenAddr := flag.String("addr", ":8080", "HTTP listen address (e.g. :8080)")
-	offlineDelay := flag.Duration("offline-timeout", 5*time.Second, "duration to mark agents offline if no heartbeat")
+	offlineDelay := flag.Duration("offline-timeout", 3*time.Second, "duration to mark agents offline if no heartbeat")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
@@ -468,7 +469,7 @@ func main() {
 
 	// Initialize store and event channel
 	store := NewStore()
-	events := make(chan eventPayload, 100) // buffered to avoid blocking
+	events := make(chan eventPayload, 1000) // increased buffer to avoid blocking
 	defer close(events)
 
 	// Start SSE broker and offline watcher
