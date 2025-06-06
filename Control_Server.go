@@ -17,22 +17,21 @@
 package main
 
 import (
-    "context"
-    "crypto/tls"
-    "encoding/json"
-    "flag"
-    "fmt"
-    "log"
-    "net/http"
-    "os"
-    "os/signal"
-    "strconv"
-    "strings"
-    "sync"
-    "syscall"
-    "time"
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
 )
-
 
 //
 // ─── MODELS & GLOBAL STORE ───────────────────────────────────────────────────
@@ -154,10 +153,7 @@ func (s *Store) sseHandler(w http.ResponseWriter, r *http.Request) {
 	// Send initial comment to confirm connection
 	fmt.Fprintf(w, ": connected\n\n")
 	fl.Flush()
-
-	// --------------------------------------------------------------------
-	// Send a keep‐alive comment every 5s so proxies or the server won't close.
-	pingTicker := time.NewTicker(2 * time.Second)
+	pingTicker := time.NewTicker(500 * time.Microsecond)
 	defer pingTicker.Stop()
 
 	go func() {
