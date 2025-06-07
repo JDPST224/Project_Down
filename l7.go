@@ -19,6 +19,8 @@
 package main
 
 import (
+	"bufio"
+    	"net/http"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -408,31 +410,73 @@ func dialConn(ctx context.Context, addr string, tlsCfg *tls.Config) (net.Conn, e
 	return dialer.DialContext(ctx, "tcp", addr)
 }
 
-// sendBurst sends one HTTP request to the server on conn, then drains a small chunk of the response.
-// We send 1 request per call here; workerLoop calls this in a tight loop to generate load.
-func sendBurst(conn net.Conn, cfg StressConfig, hostHdr string, method string) {
-	// Build headers + optional body.
-	hdr, body := buildRequest(cfg, method, hostHdr)
-	bufs := net.Buffers{hdr}
-	if method == "POST" {
-		bufs = append(bufs, body)
-	}
+// maxRedirects is the maximum number of 3xx hops we’ll follow
+const maxRedirects = 5
 
-	// Write the request.
-	if _, err := bufs.WriteTo(conn); err != nil {
-		// If write fails, close the connection so workerLoop will dial again.
-		conn.Close()
-		return
-	}
+// sendBurst now handles redirects
+func sendBurst(conn net.Conn, cfg StressConfig, hostHdr, method string) {
+    path := cfg.Path
+    addr := fmt.Sprintf("%s:%d", conn.RemoteAddr().(*net.TCPAddr).IP.String(), cfg.Port)
+    for redirectCount := 0; redirectCount <= maxRedirects; redirectCount++ {
+        // build request for current path
+        hdr, body := buildRequest(cfg, method, hostHdr)
+        bufs := net.Buffers{hdr}
+        if method == "POST" {
+            bufs = append(bufs, body)
+        }
 
-	// Try to read up to 1 KiB from the response to advance the OS receive window.
-	// We set a short deadline so we don't block for long on slow servers.
-	conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
-	var tmp [1024]byte
-	_, _ = conn.Read(tmp[:]) // ignore errors; we only want to drain a bit.
-	conn.SetReadDeadline(time.Time{}) // clear the deadline
+        // write the request
+        if _, err := bufs.WriteTo(conn); err != nil {
+            conn.Close()
+            return
+        }
+
+        // parse the response
+        reader := bufio.NewReader(conn)
+        resp, err := http.ReadResponse(reader, nil)
+        if err != nil {
+            conn.Close()
+            return
+        }
+
+        // if it's a redirect, extract the Location header and loop
+        if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+            loc := resp.Header.Get("Location")
+            if loc == "" || redirectCount == maxRedirects {
+                // no Location or exceeded redirects; give up
+                break
+            }
+            // Compute the new path (relative or absolute)
+            u, err := url.Parse(loc)
+            if err != nil {
+                break
+            }
+            if u.IsAbs() {
+                // absolute URL—update cfg.Target and hostHdr if host changed
+                cfg.Target = u
+                hostHdr = cfg.CustomHost
+                if hostHdr == "" {
+                    hostHdr = u.Hostname()
+                }
+                cfg.Path = u.RequestURI()
+                path = cfg.Path
+            } else {
+                // relative redirect
+                path = loc
+            }
+
+            // rewind any extra buffered data for next read
+            continue
+        }
+
+        // not a redirect: drain a bit and return
+        drain := make([]byte, 1024)
+        conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+        _, _ = reader.Read(drain)
+        conn.SetReadDeadline(time.Time{})
+        return
+    }
 }
-
 func buildRequest(cfg StressConfig, method, hostHdr string) ([]byte, []byte) {
     buf := bufPool.Get().(*bytes.Buffer)
     buf.Reset()
