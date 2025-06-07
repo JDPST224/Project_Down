@@ -20,7 +20,6 @@ package main
 
 import (
 	"bufio"
-    	"net/http"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -28,6 +27,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -50,14 +50,14 @@ var (
 	// HTTP method distribution: GET is 3× more likely.
 	httpMethods = []string{"GET", "GET", "GET", "POST", "HEAD"}
 
-	// contentTypes is assumed to be defined somewhere in your codebase:
+	// contentTypes for POST bodies.
 	contentTypes = []string{
 		"application/x-www-form-urlencoded",
 		"application/json",
 		"text/plain",
 	}
 
-	// languages is assumed to be defined somewhere in your codebase:
+	// languages for Accept-Language header.
 	languages = []string{
 		"en-US,en;q=0.9",
 		"en-GB,en;q=0.8",
@@ -65,6 +65,9 @@ var (
 		"de-DE,de;q=0.9,en-US;q=0.8",
 	}
 )
+
+// maxRedirects is how many 3xx hops we’ll follow before giving up.
+const maxRedirects = 5
 
 // StressConfig holds configuration for the stress test.
 type StressConfig struct {
@@ -158,73 +161,55 @@ func main() {
 	fmt.Println("Stress test completed.")
 }
 
-// workerEntry holds a cancel function for a worker goroutine.
-type workerEntry struct {
-	cancel context.CancelFunc
-}
-
-// runManager coordinates the creation and cancellation of worker goroutines per IP.
+// runManager coordinates worker goroutines per IP.
 func runManager(ctx context.Context, cfg StressConfig) {
 	workers := make(map[string][]workerEntry)
 
-	// spawn spins up one workerLoop for the given IP.
 	spawn := func(ip string) {
 		wctx, wcancel := context.WithCancel(ctx)
 		workers[ip] = append(workers[ip], workerEntry{cancel: wcancel})
 		go workerLoop(wctx, cfg, ip)
 	}
 
-	// Perform an initial rebalance based on whatever IPs we have.
 	rebalance(getSnapshotIPs(), workers, cfg.Threads, spawn)
 
 	for {
 		select {
 		case <-ctx.Done():
-			// Cancel all workers on shutdown.
 			for _, list := range workers {
 				for _, w := range list {
 					w.cancel()
 				}
 			}
 			return
-
 		case newIPs := <-rebalanceCh:
 			rebalance(newIPs, workers, cfg.Threads, spawn)
 		}
 	}
 }
 
-// workerLoop runs as long as ctx is not canceled. It dials to the given IP,
-// then repeatedly sends bursts of HTTP requests at random intervals, draining responses.
+type workerEntry struct{ cancel context.CancelFunc }
+
 func workerLoop(ctx context.Context, cfg StressConfig, ip string) {
-	// Determine which Host header to send.
 	hostHdr := cfg.Target.Hostname()
 	if cfg.CustomHost != "" {
 		hostHdr = cfg.CustomHost
 	}
-
-	// TLS configuration (insecure—no cert validation).
-	tlsCfg := &tls.Config{
-		ServerName:         hostHdr,
-		InsecureSkipVerify: true,
-	}
+	tlsCfg := &tls.Config{ServerName: hostHdr, InsecureSkipVerify: true}
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			// Dial with a short timeout and respect ctx cancellation.
 			addr := fmt.Sprintf("%s:%d", ip, cfg.Port)
 			conn, err := dialConn(ctx, addr, tlsCfg)
 			if err != nil {
-				// Dial failed; wait a bit before retrying to avoid tight loop.
 				time.Sleep(50 * time.Millisecond)
 				continue
 			}
-			// Choose a method at random.
 			method := httpMethods[rand.Intn(len(httpMethods))]
-			// Send bursts of requests on conn until an error occurs or ctx is done.
+
 			for {
 				select {
 				case <-ctx.Done():
@@ -239,11 +224,66 @@ func workerLoop(ctx context.Context, cfg StressConfig, ip string) {
 	}
 }
 
-// rebalance adjusts the number of workers per IP so that total workers == totalThreads.
+// sendBurst sends one request (with up to maxRedirects) then drains a bit.
+func sendBurst(conn net.Conn, cfg StressConfig, hostHdr, method string) {
+	for redirectCount := 0; redirectCount <= maxRedirects; redirectCount++ {
+		// Build and write the request.
+		hdr, body := buildRequest(cfg, method, hostHdr)
+		bufs := net.Buffers{hdr}
+		if method == "POST" {
+			bufs = append(bufs, body)
+		}
+		if _, err := bufs.WriteTo(conn); err != nil {
+			conn.Close()
+			return
+		}
+
+		// Read the response.
+		reader := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(reader, nil)
+		if err != nil {
+			conn.Close()
+			return
+		}
+
+		// If it's a 3xx, pick up Location and loop.
+		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+			loc := resp.Header.Get("Location")
+			if loc == "" || redirectCount == maxRedirects {
+				break
+			}
+			u, err := url.Parse(loc)
+			if err != nil {
+				break
+			}
+			if u.IsAbs() {
+				// Absolute URL: update target, hostHdr, path.
+				cfg.Target = u
+				if cfg.CustomHost != "" {
+					hostHdr = cfg.CustomHost
+				} else {
+					hostHdr = u.Hostname()
+				}
+				cfg.Path = u.RequestURI()
+			} else {
+				// Relative redirect.
+				cfg.Path = loc
+			}
+			continue
+		}
+
+		// Non-redirect: drain up to 1KiB and return.
+		drain := make([]byte, 1024)
+		conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		_, _ = reader.Read(drain)
+		conn.SetReadDeadline(time.Time{})
+		return
+	}
+}
+
 func rebalance(ipsList []string, workers map[string][]workerEntry, totalThreads int, spawn func(string)) {
 	n := len(ipsList)
 	if n == 0 {
-		// No IPs: cancel all existing workers.
 		for ip, list := range workers {
 			for _, w := range list {
 				w.cancel()
@@ -264,7 +304,6 @@ func rebalance(ipsList []string, workers map[string][]workerEntry, totalThreads 
 		}
 	}
 
-	// Cancel any workers whose IP is no longer in desired.
 	for ip, list := range workers {
 		if _, ok := desired[ip]; !ok {
 			for _, w := range list {
@@ -274,7 +313,6 @@ func rebalance(ipsList []string, workers map[string][]workerEntry, totalThreads 
 		}
 	}
 
-	// For each desired IP, spawn or cancel to match the target count.
 	for ip, want := range desired {
 		have := len(workers[ip])
 		if have < want {
@@ -293,7 +331,6 @@ func rebalance(ipsList []string, workers map[string][]workerEntry, totalThreads 
 	fmt.Printf("[rebalance] desired=%v have=%v\n", desired, mapCounts(workers))
 }
 
-// mapCounts returns a map[ip]count of how many workers are running per IP.
 func mapCounts(workers map[string][]workerEntry) map[string]int {
 	counts := make(map[string]int, len(workers))
 	for ip, list := range workers {
@@ -302,7 +339,6 @@ func mapCounts(workers map[string][]workerEntry) map[string]int {
 	return counts
 }
 
-// getSnapshotIPs returns a copy of the current IP list under mutex.
 func getSnapshotIPs() []string {
 	ipsMutex.Lock()
 	defer ipsMutex.Unlock()
@@ -311,8 +347,6 @@ func getSnapshotIPs() []string {
 	return out
 }
 
-// dnsRefresh periodically re-resolves the host every interval and triggers a rebalance.
-// It stops when ctx is canceled.
 func dnsRefresh(ctx context.Context, host string, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -321,16 +355,12 @@ func dnsRefresh(ctx context.Context, host string, interval time.Duration) {
 		select {
 		case <-ctx.Done():
 			return
-
 		case <-ticker.C:
 			addrs, err := lookupIPv4(host)
 			if err != nil {
-				// DNS error: log and skip. Keep using the old IPs.
 				log.Printf("DNS re-resolution failed for %s: %v\n", host, err)
 				continue
 			}
-
-			// If no addresses, signal to cancel all workers.
 			if len(addrs) == 0 {
 				updateIPs([]string{})
 				select {
@@ -340,8 +370,6 @@ func dnsRefresh(ctx context.Context, host string, interval time.Duration) {
 				log.Printf("DNS re-resolution returned 0 IPs for %s; canceling all workers\n", host)
 				continue
 			}
-
-			// Otherwise, update and request rebalance.
 			updateIPs(addrs)
 			fmt.Printf("Re-resolved IPs: %v\n", addrs)
 			select {
@@ -352,37 +380,30 @@ func dnsRefresh(ctx context.Context, host string, interval time.Duration) {
 	}
 }
 
-// updateIPs atomically replaces the global IP list.
 func updateIPs(newIPs []string) {
 	ipsMutex.Lock()
 	ips = newIPs
 	ipsMutex.Unlock()
 }
 
-// lookupIPv4 performs a DNS lookup for IPv4 addresses, sorts them, and returns them.
 func lookupIPv4(host string) ([]string, error) {
 	addrs, err := net.LookupIP(host)
 	if err != nil {
 		return nil, err
 	}
-
 	var out []string
 	for _, a := range addrs {
 		if ip4 := a.To4(); ip4 != nil {
 			out = append(out, ip4.String())
 		}
 	}
-
 	if len(out) == 0 {
 		return nil, fmt.Errorf("no IPv4 addresses found for %s", host)
 	}
-
-	// Sort for deterministic ordering so rebalances aren’t purely due to shuffled slice.
 	sort.Strings(out)
 	return out, nil
 }
 
-// determinePort returns the port number from the URL, or the default (80 for HTTP, 443 for HTTPS).
 func determinePort(u *url.URL) int {
 	if p := u.Port(); p != "" {
 		if i, err := strconv.Atoi(p); err == nil {
@@ -395,88 +416,14 @@ func determinePort(u *url.URL) int {
 	return 80
 }
 
-// dialConn uses a context-aware DialContext for TCP, and DialWithDialer for TLS, with a short timeout.
 func dialConn(ctx context.Context, addr string, tlsCfg *tls.Config) (net.Conn, error) {
-	dialer := &net.Dialer{
-		Timeout:   3 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
-
+	dialer := &net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}
 	if strings.HasSuffix(addr, ":443") {
-		// For TLS, we wrap DialContext in a Dialer with Timeout.
 		return tls.DialWithDialer(dialer, "tcp", addr, tlsCfg)
 	}
-	// For plain TCP, use DialContext.
 	return dialer.DialContext(ctx, "tcp", addr)
 }
 
-// maxRedirects is the maximum number of 3xx hops we’ll follow
-const maxRedirects = 5
-
-// sendBurst now handles redirects
-func sendBurst(conn net.Conn, cfg StressConfig, hostHdr, method string) {
-    path := cfg.Path
-    addr := fmt.Sprintf("%s:%d", conn.RemoteAddr().(*net.TCPAddr).IP.String(), cfg.Port)
-    for redirectCount := 0; redirectCount <= maxRedirects; redirectCount++ {
-        // build request for current path
-        hdr, body := buildRequest(cfg, method, hostHdr)
-        bufs := net.Buffers{hdr}
-        if method == "POST" {
-            bufs = append(bufs, body)
-        }
-
-        // write the request
-        if _, err := bufs.WriteTo(conn); err != nil {
-            conn.Close()
-            return
-        }
-
-        // parse the response
-        reader := bufio.NewReader(conn)
-        resp, err := http.ReadResponse(reader, nil)
-        if err != nil {
-            conn.Close()
-            return
-        }
-
-        // if it's a redirect, extract the Location header and loop
-        if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-            loc := resp.Header.Get("Location")
-            if loc == "" || redirectCount == maxRedirects {
-                // no Location or exceeded redirects; give up
-                break
-            }
-            // Compute the new path (relative or absolute)
-            u, err := url.Parse(loc)
-            if err != nil {
-                break
-            }
-            if u.IsAbs() {
-                // absolute URL—update cfg.Target and hostHdr if host changed
-                cfg.Target = u
-                hostHdr = cfg.CustomHost
-                if hostHdr == "" {
-                    hostHdr = u.Hostname()
-                }
-                cfg.Path = u.RequestURI()
-                path = cfg.Path
-            } else {
-                // relative redirect
-                path = loc
-            }
-
-            // rewind any extra buffered data for next read
-            continue
-        }
-
-        // not a redirect: drain a bit and return
-        drain := make([]byte, 1024)
-        conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
-        _, _ = reader.Read(drain)
-        conn.SetReadDeadline(time.Time{})
-        return
-    }
-}
 func buildRequest(cfg StressConfig, method, hostHdr string) ([]byte, []byte) {
     buf := bufPool.Get().(*bytes.Buffer)
     buf.Reset()
