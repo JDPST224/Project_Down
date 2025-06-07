@@ -1,3 +1,4 @@
+// control_server.go
 package main
 
 import (
@@ -17,61 +18,39 @@ import (
 	"time"
 )
 
-//
-// ─── MODELS & GLOBAL STORE ───────────────────────────────────────────────────
-//
+// ─── Models & Store ───────────────────────────────────────────────────────────
 
-// Command represents a “start” or “stop” instruction for an agent.
 type Command struct {
-	Action     string `json:"action"`      // "start", "stop", or "none"
-	URL        string `json:"url"`         // target URL for the load test
-	Threads    int    `json:"threads"`     // number of threads/connections
-	Timer      int    `json:"timer"`       // duration in seconds
-	CustomHost string `json:"custom_host"` // optional Host header override
+	Action     string `json:"action"`
+	URL        string `json:"url"`
+	Threads    int    `json:"threads"`
+	Timer      int    `json:"timer"`
+	CustomHost string `json:"custom_host"`
 }
 
-// AgentStatus holds the current state of a registered agent.
 type AgentStatus struct {
-	Online   bool   `json:"Online"`   // true if agent is considered online
-	Status   string `json:"Status"`   // e.g. "Ready", "Sending", "Error"
-	LastPing string `json:"LastPing"` // RFC3339 timestamp of last heartbeat (UTC)
+	Online   bool   `json:"Online"`
+	Status   string `json:"Status"`
+	LastPing string `json:"LastPing"`
 }
 
-// eventPayload represents a message to send via SSE.
 type eventPayload struct {
-	AgentID string      // which agent this event is for (or "" for UI)
-	Name    string      // SSE event name: "command-enqueued" or "agent-status-changed"
-	Data    interface{} // for commands: a Command; for statuses: an AgentStatus
+	AgentID string
+	Name    string
+	Data    interface{}
 }
 
-// Store holds all in‐memory data structures and their mutexes.
 type Store struct {
-	// Registered agents set
-	agentsMu sync.Mutex
-	agents   map[string]bool
-
-	// Per-agent command queues
-	cmdsMu  sync.Mutex
-	pending map[string][]Command
-
-	// Current status of each agent (use RWMutex for frequent reads)
-	statusMu   sync.RWMutex
+	agents     map[string]bool
+	agentsMu   sync.Mutex
+	pending    map[string][]Command
+	cmdsMu     sync.Mutex
 	statuses   map[string]*AgentStatus
-
-	// SSE clients: map[clientID]*sseClient
-	sseMu      sync.Mutex
+	statusMu   sync.RWMutex
 	sseClients map[string]*sseClient
+	sseMu      sync.Mutex
 }
 
-// sseClient wraps a single SSE connection to an agent or UI
-type sseClient struct {
-	id      string
-	agentID string // "" means “subscribe to all events (UI)”
-	writer  http.ResponseWriter
-	flusher http.Flusher
-}
-
-// NewStore initializes and returns a pointer to an empty Store.
 func NewStore() *Store {
 	return &Store{
 		agents:     make(map[string]bool),
@@ -81,30 +60,40 @@ func NewStore() *Store {
 	}
 }
 
-//
-// ─── HELPERS ──────────────────────────────────────────────────────────────────
-//
+type sseClient struct {
+	id      string
+	agentID string
+	writer  http.ResponseWriter
+	flusher http.Flusher
+}
 
-// writeJSON sets Content-Type to application/json and writes v as JSON.
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
 func writeJSON(w http.ResponseWriter, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		log.Printf("[CONTROL] writeJSON error: %v\n", err)
+		log.Printf("[CONTROL] writeJSON error: %v", err)
 	}
 }
 
-// methodNotAllowed returns HTTP 405.
 func methodNotAllowed(w http.ResponseWriter) {
 	http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 }
 
-//
-// ─── SSE BROKER & HANDLERS ────────────────────────────────────────────────────
-//
+// ─── SSE Management ──────────────────────────────────────────────────────────
 
-// sseHandler upgrades an HTTP GET to an SSE connection.
-// If a non‐empty ?agentID is provided, that client only gets its own events.
-// If agentID="" (no query param), treat it as a “UI subscriber” → gets everything.
+func (s *Store) addClient(c *sseClient) {
+	s.sseMu.Lock()
+	s.sseClients[c.id] = c
+	s.sseMu.Unlock()
+}
+
+func (s *Store) removeClient(id string) {
+	s.sseMu.Lock()
+	delete(s.sseClients, id)
+	s.sseMu.Unlock()
+}
+
 func (s *Store) sseHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		methodNotAllowed(w)
@@ -112,9 +101,6 @@ func (s *Store) sseHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	agentID := r.URL.Query().Get("agentID")
-	// NOTE: We do NOT reject agentID == "". Empty means UI subscriber.
-
-	// Set required SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -125,225 +111,160 @@ func (s *Store) sseHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create unique clientID
 	clientID := agentID + "_" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	client := &sseClient{id: clientID, agentID: agentID, writer: w, flusher: fl}
+	s.addClient(client)
 
-	// Register client
-	s.sseMu.Lock()
-	s.sseClients[clientID] = client
-	s.sseMu.Unlock()
-
-	// Send initial comment and retry‐directive to confirm connection
-	fmt.Fprintf(w, ": connected\n\n")
-	fmt.Fprintf(w, "retry: 2000\n\n") // instruct client to retry in 2 s if disconnected
+	// initial handshake
+	fmt.Fprintf(w, ": connected\n\nretry: 2000\n\n")
 	fl.Flush()
 
-	// Send a keep‐alive comment every 250 ms so that proxies don't drop the connection
-	pingTicker := time.NewTicker(250 * time.Millisecond)
-	defer pingTicker.Stop()
-
-	go func() {
-		for {
-			select {
-			case <-r.Context().Done():
-				return
-			case <-pingTicker.C:
-				func() {
-					defer func() { recover() }()
-					fmt.Fprintf(w, ": ping\n\n")
-					fl.Flush()
-				}()
-			}
-		}
+	pingTicker := time.NewTicker(5 * time.Second)
+	defer func() {
+		pingTicker.Stop()
+		s.removeClient(clientID)
 	}()
 
-	// Block until client disconnects
-	<-r.Context().Done()
-
-	// Cleanup
-	s.sseMu.Lock()
-	delete(s.sseClients, clientID)
-	s.sseMu.Unlock()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-pingTicker.C:
+			if _, err := fmt.Fprintf(w, ": ping\n\n"); err != nil {
+				return
+			}
+			fl.Flush()
+		}
+	}
 }
 
-// runSSEBroker listens on the events channel and pushes events to matching clients.
-// For “command-enqueued”: send raw Command JSON. For “agent-status-changed”: wrap into {agentID, status}.
 func (s *Store) runSSEBroker(events <-chan eventPayload) {
 	for ev := range events {
+		var targets []*sseClient
+
+		// snapshot under lock
+		s.sseMu.Lock()
+		for _, c := range s.sseClients {
+			switch ev.Name {
+			case "command-enqueued":
+				if c.agentID == ev.AgentID {
+					targets = append(targets, c)
+				}
+			case "agent-status-changed":
+				if c.agentID == "" || c.agentID == ev.AgentID {
+					targets = append(targets, c)
+				}
+			}
+		}
+		s.sseMu.Unlock()
+
+		// send outside lock
 		switch ev.Name {
 		case "command-enqueued":
-			// ev.Data is a Command. We send raw JSON so the agent can unmarshal into Command.
-			rawCmd, err := json.Marshal(ev.Data)
-			if err != nil {
-				continue
+			raw, _ := json.Marshal(ev.Data)
+			for _, c := range targets {
+				fmt.Fprintf(c.writer, "event: %s\n", ev.Name)
+				fmt.Fprintf(c.writer, "data: %s\n\n", raw)
+				c.flusher.Flush()
 			}
-
-			s.sseMu.Lock()
-			for _, client := range s.sseClients {
-				// Only send “command-enqueued” to:
-				//   • the specific agent (client.agentID == ev.AgentID), or
-				//   • NO ONE ELSE. (UI does not need raw Command JSON in this example.)
-				if client.agentID != ev.AgentID {
-					continue
-				}
-				func() {
-					defer func() { recover() }()
-					fmt.Fprintf(client.writer, "event: %s\n", ev.Name)
-					fmt.Fprintf(client.writer, "data: %s\n\n", rawCmd)
-					client.flusher.Flush()
-				}()
-			}
-			s.sseMu.Unlock()
 
 		case "agent-status-changed":
-			// ev.Data is an AgentStatus. Wrap it so UI can see both agentID and status.
-			wrapper := map[string]interface{}{
+			payload := map[string]interface{}{
 				"agentID": ev.AgentID,
 				"status":  ev.Data,
 			}
-			wrappedBytes, err := json.Marshal(wrapper)
-			if err != nil {
-				continue
+			raw, _ := json.Marshal(payload)
+			for _, c := range targets {
+				fmt.Fprintf(c.writer, "event: %s\n", ev.Name)
+				fmt.Fprintf(c.writer, "data: %s\n\n", raw)
+				c.flusher.Flush()
 			}
-
-			s.sseMu.Lock()
-			for _, client := range s.sseClients {
-				// Send to:
-				//   • exact‐match client.agentID == ev.AgentID (the agent itself), and
-				//   • any UI subscriber where client.agentID == "".
-				if client.agentID != ev.AgentID && client.agentID != "" {
-					continue
-				}
-				func() {
-					defer func() { recover() }()
-					fmt.Fprintf(client.writer, "event: %s\n", ev.Name)
-					fmt.Fprintf(client.writer, "data: %s\n\n", wrappedBytes)
-					client.flusher.Flush()
-				}()
-			}
-			s.sseMu.Unlock()
-
-		default:
-			// ignore unknown event types
 		}
 	}
 }
 
-//
-// ─── BACKGROUND OFFLINE WATCHER ────────────────────────────────────────────────
-//
+// ─── Offline Watcher ─────────────────────────────────────────────────────────
 
-// runOfflineWatcher periodically scans all agents’ LastPing timestamps.
-// If any agent hasn’t pinged within offlineTimeout, mark it offline and broadcast.
-func (s *Store) runOfflineWatcher(offlineTimeout time.Duration, events chan<- eventPayload) {
-	ticker := time.NewTicker(1 * time.Second) // check once per second
+func (s *Store) runOfflineWatcher(timeout time.Duration, events chan<- eventPayload) {
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		cutoff := time.Now().UTC().Add(-offlineTimeout)
-		var toBroadcast []eventPayload
+	for now := range ticker.C {
+		cutoff := now.UTC().Add(-timeout)
+		var toOffline []string
 
-		s.statusMu.Lock()
-		for agentID, st := range s.statuses {
+		s.statusMu.RLock()
+		for id, st := range s.statuses {
 			last, err := time.Parse(time.RFC3339, st.LastPing)
-			if err != nil {
-				// Malformed timestamp → mark offline immediately
-				if st.Online {
-					st.Online = false
-					st.Status = ""
-					toBroadcast = append(toBroadcast, eventPayload{
-						AgentID: agentID,
-						Name:    "agent-status-changed",
-						Data:    *st,
-					})
-				}
-				continue
-			}
-			if last.Before(cutoff) && st.Online {
-				st.Online = false
-				st.Status = ""
-				toBroadcast = append(toBroadcast, eventPayload{
-					AgentID: agentID,
-					Name:    "agent-status-changed",
-					Data:    *st,
-				})
+			if err == nil && st.Online && last.Before(cutoff) {
+				toOffline = append(toOffline, id)
 			}
 		}
-		s.statusMu.Unlock()
+		s.statusMu.RUnlock()
 
-		// Broadcast changes (outside the lock)
-		for _, ev := range toBroadcast {
-			events <- ev
-			log.Printf("[CONTROL] Marked %s OFFLINE (last ping %s)\n", ev.AgentID, ev.Data.(AgentStatus).LastPing)
+		for _, id := range toOffline {
+			s.statusMu.Lock()
+			st := s.statuses[id]
+			st.Online = false
+			st.Status = ""
+			s.statusMu.Unlock()
+
+			events <- eventPayload{AgentID: id, Name: "agent-status-changed", Data: *st}
+			log.Printf("[CONTROL] Marked %s OFFLINE", id)
 		}
 	}
 }
 
-//
-// ─── HTTP HANDLERS FOR CONTROL SERVER ─────────────────────────────────────────
-//
+// ─── HTTP Handlers ───────────────────────────────────────────────────────────
 
-// handleCommand enqueues a “start” command for every registered agent,
-// then emits a “command-enqueued” SSE event containing raw Command JSON.
+// enqueue start commands to all agents
 func (s *Store) handleCommand(events chan<- eventPayload) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w)
 			return
 		}
-
-		// Parse form values
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, "invalid form data", http.StatusBadRequest)
 			return
 		}
-		url := strings.TrimSpace(r.FormValue("url"))
-		threads, err := strconv.Atoi(r.FormValue("threads"))
-		if err != nil {
-			http.Error(w, "invalid threads parameter", http.StatusBadRequest)
+
+		threads, err1 := strconv.Atoi(r.FormValue("threads"))
+		timer, err2 := strconv.Atoi(r.FormValue("timer"))
+		if err1 != nil || err2 != nil {
+			http.Error(w, "invalid numeric parameter", http.StatusBadRequest)
 			return
 		}
-		timer, err := strconv.Atoi(r.FormValue("timer"))
-		if err != nil {
-			http.Error(w, "invalid timer parameter", http.StatusBadRequest)
-			return
-		}
-		customHost := r.FormValue("custom_host")
 
 		cmd := Command{
 			Action:     "start",
-			URL:        url,
+			URL:        strings.TrimSpace(r.FormValue("url")),
 			Threads:    threads,
 			Timer:      timer,
-			CustomHost: customHost,
+			CustomHost: r.FormValue("custom_host"),
 		}
 
-		// Enqueue for every agent
+		var evs []eventPayload
 		s.agentsMu.Lock()
-		for agentID := range s.agents {
+		for id := range s.agents {
 			s.cmdsMu.Lock()
-			s.pending[agentID] = append(s.pending[agentID], cmd)
+			s.pending[id] = append(s.pending[id], cmd)
 			s.cmdsMu.Unlock()
-
-			// Broadcast “command-enqueued” for that agent
-			events <- eventPayload{
-				AgentID: agentID,
-				Name:    "command-enqueued",
-				Data:    cmd,
-			}
-			log.Printf("[CONTROL] Enqueued START for %s → %+v\n", agentID, cmd)
+			evs = append(evs, eventPayload{AgentID: id, Name: "command-enqueued", Data: cmd})
 		}
 		s.agentsMu.Unlock()
 
-		// Redirect back to UI
+		go func() {
+			for _, ev := range evs {
+				events <- ev
+				log.Printf("[CONTROL] Enqueued %+v to %s", cmd, ev.AgentID)
+			}
+		}()
+
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 	}
 }
 
-// agentPollHandler responds to an agent’s GET poll.
-// If there’s a queued command, send it (and remove from queue).
-// Otherwise return Action:"none". Also updates LastPing and Online.
 func (s *Store) agentPollHandler(w http.ResponseWriter, r *http.Request) {
 	agentID := r.URL.Query().Get("agentID")
 	if agentID == "" {
@@ -352,43 +273,33 @@ func (s *Store) agentPollHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339)
-
-	// Register agent and update LastPing
 	s.agentsMu.Lock()
 	s.agents[agentID] = true
 	s.agentsMu.Unlock()
 
 	s.statusMu.Lock()
-	if entry, exists := s.statuses[agentID]; exists {
-		entry.Online = true
-		entry.LastPing = now
+	if st, ok := s.statuses[agentID]; ok {
+		st.Online = true
+		st.LastPing = now
 	} else {
-		s.statuses[agentID] = &AgentStatus{
-			Online:   true,
-			Status:   "Ready",
-			LastPing: now,
-		}
+		s.statuses[agentID] = &AgentStatus{Online: true, Status: "Ready", LastPing: now}
 	}
 	s.statusMu.Unlock()
 
-	// Pop next command if one exists
 	s.cmdsMu.Lock()
 	queue := s.pending[agentID]
 	if len(queue) > 0 {
 		cmd := queue[0]
 		s.pending[agentID] = queue[1:]
 		s.cmdsMu.Unlock()
-		writeJSON(w, cmd) // return the raw Command JSON
+		writeJSON(w, cmd)
 		return
 	}
 	s.cmdsMu.Unlock()
 
-	// No commands → return none
 	writeJSON(w, Command{Action: "none"})
 }
 
-// agentStatusHandler accepts a POST with JSON {"agentID":"…","status":"…"}.
-// Updates the agent’s status and broadcasts “agent-status-changed” wrapped JSON.
 func (s *Store) agentStatusHandler(events chan<- eventPayload) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -396,43 +307,35 @@ func (s *Store) agentStatusHandler(events chan<- eventPayload) http.HandlerFunc 
 			return
 		}
 
-		var payload struct {
+		var p struct {
 			AgentID string `json:"agentID"`
 			Status  string `json:"status"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
 			return
 		}
-		now := time.Now().UTC().Format(time.RFC3339)
 
+		now := time.Now().UTC().Format(time.RFC3339)
 		s.statusMu.Lock()
-		entry, exists := s.statuses[payload.AgentID]
-		if !exists {
-			entry = &AgentStatus{}
+		st, ok := s.statuses[p.AgentID]
+		if !ok {
 			s.agentsMu.Lock()
-			s.agents[payload.AgentID] = true
+			s.agents[p.AgentID] = true
 			s.agentsMu.Unlock()
-			s.statuses[payload.AgentID] = entry
+			st = &AgentStatus{}
+			s.statuses[p.AgentID] = st
 		}
-		entry.Online = true
-		entry.Status = payload.Status
-		entry.LastPing = now
+		st.Online = true
+		st.Status = p.Status
+		st.LastPing = now
 		s.statusMu.Unlock()
 
-		// Broadcast “agent-status-changed” with wrapped JSON
-		events <- eventPayload{
-			AgentID: payload.AgentID,
-			Name:    "agent-status-changed",
-			Data:    *entry,
-		}
-
+		events <- eventPayload{AgentID: p.AgentID, Name: "agent-status-changed", Data: *st}
 		w.WriteHeader(http.StatusOK)
 	}
 }
 
-// listAgentStatuses returns a JSON map[agentID]AgentStatus.
-// Offline agents appear with Online:false and empty Status.
 func (s *Store) listAgentStatuses(w http.ResponseWriter, r *http.Request) {
 	s.statusMu.RLock()
 	defer s.statusMu.RUnlock()
@@ -448,82 +351,61 @@ func (s *Store) listAgentStatuses(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
-// renderInterface serves the static HTML interface (./Interface/index.html).
 func renderInterface(w http.ResponseWriter, r *http.Request) {
-	const filePath = "Interface/index.html"
-	http.ServeFile(w, r, filePath)
+	http.ServeFile(w, r, "Interface/index.html")
 }
 
-//
-// ─── MAIN FUNCTION: SETUP & GRACEFUL SHUTDOWN ─────────────────────────────────
-//
+// ─── Main ────────────────────────────────────────────────────────────────────
 
 func main() {
-	// Parse flags
-	listenAddr := flag.String("addr", ":8080", "HTTP listen address (e.g. :8080)")
-	offlineDelay := flag.Duration("offline-timeout", 3*time.Second, "duration to mark agents offline if no heartbeat")
+	addr := flag.String("addr", ":8080", "listen address")
+	offlineTO := flag.Duration("offline-timeout", 3*time.Second, "offline timeout")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Printf("[CONTROL] Starting server (press Ctrl+C to stop)\n")
+	log.Println("[CONTROL] Starting")
 
-	// Initialize store and event channel
 	store := NewStore()
-	events := make(chan eventPayload, 1000) // increased buffer to avoid blocking
+	events := make(chan eventPayload, 1000)
 	defer close(events)
 
-	// Start SSE broker and offline watcher
 	go store.runSSEBroker(events)
-	go store.runOfflineWatcher(*offlineDelay, events)
+	go store.runOfflineWatcher(*offlineTO, events)
 
-	// Set up HTTP routes
 	mux := http.NewServeMux()
-
-	// Serve static files under /Interface/
-	mux.Handle(
-		"/Interface/",
-		http.StripPrefix("/Interface/", http.FileServer(http.Dir("Interface"))),
-	)
-
-	// API endpoints
+	mux.Handle("/Interface/", http.StripPrefix("/Interface/", http.FileServer(http.Dir("Interface"))))
 	mux.HandleFunc("/events", store.sseHandler)
 	mux.HandleFunc("/command", store.handleCommand(events))
 	mux.HandleFunc("/poll-agent", store.agentPollHandler)
 	mux.HandleFunc("/agent-status", store.agentStatusHandler(events))
 	mux.HandleFunc("/agent-statuses", store.listAgentStatuses)
-
-	// Serve index.html at root
 	mux.HandleFunc("/", renderInterface)
 
-	// Wrap with timeouts; WriteTimeout=0 so SSE isn't cut off
 	srv := &http.Server{
-		Addr:         *listenAddr,
+		Addr:         *addr,
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 0,
-		// <<< Disable HTTP/2 so SSE stays on HTTP/1.1 >>>
-		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 		IdleTimeout:  60 * time.Second,
+		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 	}
 
-	// Graceful shutdown on SIGINT/SIGTERM
+	// graceful shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
 		<-ctx.Done()
-		log.Printf("[CONTROL] Shutdown signal received, shutting down...\n")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		log.Println("[CONTROL] Shutting down")
+		shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			log.Printf("[CONTROL] Graceful shutdown failed: %v\n", err)
-		}
+		srv.Shutdown(shCtx)
 	}()
 
-	log.Printf("[CONTROL] Listening on %s\n", *listenAddr)
+	log.Printf("[CONTROL] Listening on %s\n", *addr)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("[CONTROL] ListenAndServe error: %v\n", err)
+		log.Fatalf("[CONTROL] ListenAndServe: %v", err)
 	}
 
-	log.Printf("[CONTROL] Server stopped\n")
+	log.Println("[CONTROL] Stopped")
 }
