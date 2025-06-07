@@ -1,3 +1,4 @@
+<!-- index.html -->
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -12,7 +13,7 @@
 
     <!-- Form to send a “Start” command to all agents -->
     <div class="container form-container">
-      <form method="POST" action="/command">
+      <form id="commandForm">
         <article class="card">
           <label for="url">Target URL</label>
           <input id="url" type="text" name="url" placeholder="https://example.com" required />
@@ -23,46 +24,64 @@
           <label for="timer">Timer (seconds)</label>
           <input id="timer" type="number" name="timer" placeholder="Duration" required />
 
-          <button class="btn btn-primary" type="submit">Start</button>
-        </article>
-
-        <article class="card">
-          <h2>Custom Header</h2>
           <label for="custom_host">Custom Host (optional)</label>
           <input id="custom_host" type="text" name="custom_host" placeholder="e.g., custom.example.com" />
+
+          <button class="btn btn-primary" type="submit">Start</button>
+        </article>
+        <!-- Agent Status Section -->
+        <article class="card">
+          <div class="status-header">
+            <h2>Agent Status</h2>
+            <div class="agent-count">
+              <span id="blinkDot" class="blink-dot"></span>
+              Online Agents: 
+              <span id="onlineCount">0</span>
+            </div>
+          </div>
+          <div class="scroller">
+            <table>
+              <thead>
+                <tr>
+                  <th>Agent</th>
+                  <th>Online</th>
+                  <th>Status</th>
+                  <th>Last Ping</th>
+                </tr>
+              </thead>
+              <tbody>
+                <!-- Rows will be populated by JavaScript -->
+              </tbody>
+            </table>
+          </div>
         </article>
       </form>
     </div>
 
-    <!-- Agent Status Section -->
-    <div class="container status-container">
-      <div class="status-header">
-        <h2>Agent Status</h2>
-        <div class="agent-count">
-          <span id="blinkDot" class="blink-dot"></span>
-          Online Agents: 
-          <span id="onlineCount">0</span>
-        </div>
+    <!-- Command History Section -->
+    <div class="container CommandH-container">
+      <div class="CommandH-header">
+        <h2>Command History</h2>
       </div>
       <div class="scroller">
         <table>
           <thead>
             <tr>
-              <th>Agent</th>
-              <th>Online</th>
-              <th>Status</th>
-              <th>Last Ping</th>
+              <th>Time</th>
+              <th>URL</th>
+              <th>Threads</th>
+              <th>Timer</th>
+              <th>Custom Host</th>
             </tr>
           </thead>
-          <tbody>
-            <!-- Rows will be populated by JavaScript -->
+          <tbody id="historyBody">
+            <!-- History rows added by JavaScript -->
           </tbody>
         </table>
       </div>
     </div>
   </div>
 
-  <!-- Updated main.js -->
   <script type="text/javascript" src="/Interface/main.js"></script>
 </body>
 </html>

@@ -119,12 +119,6 @@ body {
 }
 
 /* Status Section */
-.status-container {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
 .status-header {
   display: flex;
   justify-content: space-between;
@@ -165,13 +159,13 @@ body {
 table {
   width: 100%;
   border-collapse: collapse;
-  background-color: #1E1E1E;
+  background-color: #1A1A1A;
   border-radius: 8px;
   overflow: hidden;
 }
 
 thead {
-  background-color: #2A2A2A;
+  background-color: #121212;
 }
 
 th, td {
@@ -199,12 +193,12 @@ tbody tr:hover {
 }
 
 .online .online-cell {
-  color: #A3E635; /* Soft green */
+  color: #A3E635;
   font-weight: bold;
 }
 
 .offline .online-cell {
-  color: #F87171; /* Soft red */
+  color: #F87171;
   font-weight: bold;
 }
 
@@ -219,24 +213,32 @@ tbody tr:hover {
   margin-right: 8px;
   width: 10px;
   height: 10px;
-  background-color: #4CAF50;  /* Soft green */
+  background-color: #4CAF50;
   border-radius: 50%;
   animation: blink 2s infinite ease-in-out;
 }
 
 /* Keyframes for blinking effect */
 @keyframes blink {
-  0%, 50%, 100% {
-    opacity: 1;
-  }
-  25%, 75% {
-    opacity: 0;
-  }
+  0%, 50%, 100% { opacity: 1; }
+  25%, 75%     { opacity: 0; }
 }
 
 /* Initially hide the dot; JS will toggle visibility */
 #blinkDot {
   visibility: hidden;
+}
+
+/* Command History Section */
+.CommandH-container {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.CommandH-header h2 {
+  font-size: 1.5rem;
+  color: #FFFFFF;
 }
 
 /* Responsive tweaks */
