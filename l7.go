@@ -230,7 +230,7 @@ func workerLoop(ctx context.Context, cfg StressConfig, ip string) {
 					return
 				default:
 					sendBurst(conn, cfg, hostHdr, method)
-					time.Sleep(time.Duration(rand.Intn(80)+10) * time.Millisecond)
+					time.Sleep(time.Duration(rand.Intn(200)+50) * time.Millisecond)
 				}
 			}
 		}
