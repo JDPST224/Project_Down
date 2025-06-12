@@ -358,7 +358,7 @@ func renderInterface(w http.ResponseWriter, r *http.Request) {
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 func main() {
-	addr := flag.String("addr", ":8080", "listen address")
+	addr := flag.String("addr", ":8081", "listen address")
 	offlineTO := flag.Duration("offline-timeout", 3*time.Second, "offline timeout")
 	flag.Parse()
 
