@@ -2,224 +2,250 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
+	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
 	"regexp"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 const (
-	timeout     = 10 * time.Second
 	dialTimeout = 5 * time.Second
-	numWorkers  = 200
 )
 
 var (
-	httpsTextSources = []string{
+	// plaintext proxy sources
+	extSources = []string{
 		"https://www.proxy-list.download/api/v1/get?type=https",
 		"https://api.openproxylist.xyz/https.txt",
 		"https://openproxylist.xyz/https.txt",
 		"https://proxyspace.pro/https.txt",
 		"https://api.proxyscrape.com/v2/?request=displayproxies&protocol=https&timeout=1000&country=all&ssl=all&anonymity=all",
 	}
-	websiteSources = []string{
+	// HTML proxy sources
+	htmlSources = []string{
 		"https://free-proxy-list.net/",
 		"https://www.sslproxies.org/",
 		"https://www.proxy-list.download/HTTPS",
 		"https://www.us-proxy.org/",
 	}
 	proxyRegex = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}:\d{1,5}\b`)
+	userAgents = []string{
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+		"Mozilla/5.0 (X11; Linux x86_64)",
+	}
+)
 
-	validProxies []string
-	proxyMu      sync.RWMutex
+// ProxyResult holds details of a proxy test
+type ProxyResult struct {
+	Addr      string
+	Latency   time.Duration
+	Anonymous bool
+}
 
-	textCount int64
-	htmlCount int64
+var (
+	// counters
+	textCount     int64
+	htmlCount     int64
+	evaluateCount int64
+	// live store
+	liveProxies = make(map[string]struct{})
+	liveList    []string
+	mu          sync.RWMutex
 )
 
 func main() {
-	// 1) scrape & dedupe
+	// flags
+	topN := flag.Int("top", 100, "number of high-quality to keep (unused)")
+	workers := flag.Int("workers", 200, "concurrency level")
+	flag.Parse()
+
+	// start server immediately
+	go startServer()
+
+	// scrape
 	raw := scrapeAll()
 	unique := dedupe(raw)
+	log.Printf("📝 Text: %d   🌐 HTML: %d   🔑 Unique: %d",
+		atomic.LoadInt64(&textCount), atomic.LoadInt64(&htmlCount), len(unique))
 
-	// 2) log totals only
-	log.Printf("📝 Total scraped from text sources: %d", atomic.LoadInt64(&textCount))
-	log.Printf("🌐 Total scraped from HTML sources: %d", atomic.LoadInt64(&htmlCount))
-	log.Printf("🔑 Total unique candidates: %d", len(unique))
+	// evaluate (adds successful into liveList)
+	log.Println("🚧 Evaluating proxies...")
+	results := evaluateProxies(unique, *workers)
+	log.Printf("✅ Tested %d, %d succeeded.", atomic.LoadInt64(&evaluateCount), len(results))
 
-	// 3) start server & check
-	go startServer()
-	runChecks(unique)
+	// optionally select high-quality for metrics
+	sort.Slice(results, func(i, j int) bool { return results[i].Latency < results[j].Latency })
+	hqCount := min(len(results), *topN)
+	log.Printf("🔝 Top %d high-quality selected.", hqCount)
 
+	// block
 	select {}
-}
-
-func scrapeAll() []string {
-	var wg sync.WaitGroup
-	out := make(chan string, 1000)
-
-	for _, src := range httpsTextSources {
-		wg.Add(1)
-		go func(u string) {
-			defer wg.Done()
-			fetchText(u, out)
-		}(src)
-	}
-	for _, src := range websiteSources {
-		wg.Add(1)
-		go func(u string) {
-			defer wg.Done()
-			fetchHTML(u, out)
-		}(src)
-	}
-
-	go func() {
-		wg.Wait()
-		close(out)
-	}()
-
-	var all []string
-	for p := range out {
-		all = append(all, p)
-	}
-	return all
-}
-
-func fetchText(src string, out chan<- string) {
-	resp, err := http.Get(src)
-	if err != nil {
-		log.Printf("⚠️ GET %s failed: %v", src, err)
-		return
-	}
-	defer resp.Body.Close()
-
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if isProxyFormat(line) {
-			atomic.AddInt64(&textCount, 1)
-			out <- line
-		}
-	}
-}
-
-func fetchHTML(src string, out chan<- string) {
-	resp, err := http.Get(src)
-	if err != nil {
-		log.Printf("⚠️ GET %s failed: %v", src, err)
-		return
-	}
-	defer resp.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("⚠️ read %s error: %v", src, err)
-		return
-	}
-
-	for _, m := range proxyRegex.FindAllString(string(body), -1) {
-		if isProxyFormat(m) {
-			atomic.AddInt64(&htmlCount, 1)
-			out <- m
-		}
-	}
-}
-
-func dedupe(list []string) []string {
-	seen := make(map[string]struct{}, len(list))
-	var unique []string
-	for _, p := range list {
-		if _, ok := seen[p]; !ok {
-			seen[p] = struct{}{}
-			unique = append(unique, p)
-		}
-	}
-	return unique
 }
 
 func startServer() {
 	http.HandleFunc("/proxies", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		proxyMu.RLock()
-		defer proxyMu.RUnlock()
-		for _, addr := range validProxies {
+		mu.RLock()
+		defer mu.RUnlock()
+		for _, addr := range liveList {
 			fmt.Fprintln(w, addr)
 		}
 	})
-	log.Printf("🚀 Server listening on :8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatalf("Server error: %v", err)
+	log.Println("🚀 Server listening on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func scrapeAll() []string {
+	var wg sync.WaitGroup
+	ch := make(chan string, 2000)
+	for _, src := range extSources {
+		wg.Add(1)
+		go func(u string) { defer wg.Done(); fetchText(u, ch) }(src)
+	}
+	for _, src := range htmlSources {
+		wg.Add(1)
+		go func(u string) { defer wg.Done(); fetchHTML(u, ch) }(src)
+	}
+	go func() { wg.Wait(); close(ch) }()
+
+	var all []string
+	for addr := range ch {
+		all = append(all, addr)
+	}
+	return all
+}
+
+func fetchText(src string, out chan<- string) {
+	client := newClient()
+	resp, err := client.Get(src)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	
+	s := bufio.NewScanner(resp.Body)
+	for s.Scan() {
+		addr := s.Text()
+		if isProxyFormat(addr) {
+			atomic.AddInt64(&textCount, 1)
+			out <- addr
+		}
 	}
 }
 
-func runChecks(proxies []string) {
-	in := make(chan string, len(proxies))
-	var wg sync.WaitGroup
+func fetchHTML(src string, out chan<- string) {
+	client := newClient()
+	resp, err := client.Get(src)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
 
-	for i := 0; i < numWorkers; i++ {
+	body, _ := ioutil.ReadAll(resp.Body)
+	for _, addr := range proxyRegex.FindAllString(string(body), -1) {
+		if isProxyFormat(addr) {
+			atomic.AddInt64(&htmlCount, 1)
+			out <- addr
+		}
+	}
+}
+
+func newClient() *http.Client {
+	ru := userAgents[randomInt(len(userAgents))]
+	tr := &http.Transport{DialContext: (&net.Dialer{Timeout: dialTimeout}).DialContext}
+	iClient := &http.Client{Timeout: 5 * time.Second, Transport: tr}
+	iClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		req.Header.Set("User-Agent", ru)
+		return nil
+	}
+	return iClient
+}
+
+func evaluateProxies(list []string, workers int) []ProxyResult {
+	in := make(chan string, len(list))
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for addr := range in {
-				if checkProxy(addr) {
-					proxyMu.Lock()
-					if !contains(validProxies, addr) {
-						validProxies = append(validProxies, addr)
-						log.Printf("✅ live %s", addr)
-					}
-					proxyMu.Unlock()
+				atomic.AddInt64(&evaluateCount, 1)
+				if pr, ok := testProxy(addr); ok {
+					mu.Lock()
+					addLive(pr.Addr)
+					mu.Unlock()
+					// optionally store pr for HQ metrics
 				}
 			}
 		}()
 	}
-
-	for _, addr := range proxies {
-		in <- addr
-	}
+	for _, a := range list { in <- a }
 	close(in)
 	wg.Wait()
 
-	log.Printf("✅ Completed all HTTPS proxy checks (%d live)", len(validProxies))
+	var res []ProxyResult
+	mu.RLock()
+	for _, addr := range liveList {
+		res = append(res, ProxyResult{Addr: addr})
+	}
+	mu.RUnlock()
+	return res
 }
 
-func checkProxy(addr string) bool {
+func testProxy(addr string) (ProxyResult, bool) {
 	proxyURL := &url.URL{Scheme: "http", Host: addr}
-	client := &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			Proxy:       http.ProxyURL(proxyURL),
-			DialContext: (&net.Dialer{Timeout: dialTimeout}).DialContext,
-		},
-	}
-	resp, err := client.Get("https://httpbin.org/ip")
+	iClient := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL), DialContext: (&net.Dialer{Timeout: dialTimeout}).DialContext}}
+
+	start := time.Now()
+	resp, err := iClient.Get("https://httpbin.org/headers")
 	if err != nil {
-		return false
+		return ProxyResult{}, false
 	}
-	io.Copy(io.Discard, resp.Body)
+	lat := time.Since(start)
+	body, _ := ioutil.ReadAll(resp.Body)
 	resp.Body.Close()
-	return resp.StatusCode >= 200 && resp.StatusCode < 300
+	anon := !regexp.MustCompile(`"X-Forwarded-For":`).Match(body)
+	return ProxyResult{Addr: addr, Latency: lat, Anonymous: anon}, true
 }
 
-func isProxyFormat(proxy string) bool {
-	host, port, err := net.SplitHostPort(proxy)
-	if err != nil {
-		return false
-	}
-	return net.ParseIP(host) != nil && port != ""
-}
-
-func contains(slice []string, item string) bool {
-	for _, x := range slice {
-		if x == item {
-			return true
+func dedupe(list []string) []string {
+	seen := make(map[string]struct{}, len(list))
+	var u []string
+	for _, a := range list {
+		if _, ok := seen[a]; !ok {
+			seen[a] = struct{}{}
+			u = append(u, a)
 		}
 	}
-	return false
+	return u
 }
+
+func isProxyFormat(p string) bool {
+	h, po, err := net.SplitHostPort(p)
+	return err == nil && net.ParseIP(h) != nil && po != ""
+}
+
+func addLive(addr string) {
+	if _, exists := liveProxies[addr]; !exists {
+		liveProxies[addr] = struct{}{}
+		liveList = append(liveList, addr)
+	}
+}
+
+func randomInt(n int) int {
+	b, _ := rand.Int(rand.Reader, big.NewInt(int64(n)))
+	return int(b.Int64())
+}
+
+func min(a, b int) int { if a < b { return a }; return b }
