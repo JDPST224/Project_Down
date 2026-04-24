@@ -1,0 +1,135 @@
+<!-- index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Control Server</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/Interface/style.css" />
+</head>
+<body>
+  <div class="grain"></div>
+
+  <div class="main-container">
+    <header class="site-header">
+      <div class="header-eyebrow">SYSTEM CONTROL</div>
+      <h1 class="title">Control<span class="title-accent">Server</span></h1>
+      <div class="header-line"></div>
+    </header>
+
+    <div class="top-grid">
+      <!-- Command form — standalone, NOT wrapping the status table -->
+      <section class="panel" aria-label="Send Command">
+        <div class="panel-label">01 — DISPATCH</div>
+        <h2 class="panel-title">Send Command</h2>
+
+        <form id="commandForm" autocomplete="off" novalidate>
+          <div class="field">
+            <label for="url">Target URL</label>
+            <input
+              id="url" type="url" name="url"
+              placeholder="https://example.com"
+              required
+              spellcheck="false"
+            />
+            <div class="field-error" id="urlError"></div>
+          </div>
+
+          <div class="field-row">
+            <div class="field">
+              <label for="threads">Threads</label>
+              <input
+                id="threads" type="number" name="threads"
+                placeholder="64" min="1" max="10000" required
+              />
+            </div>
+            <div class="field">
+              <label for="timer">Duration (s)</label>
+              <input
+                id="timer" type="number" name="timer"
+                placeholder="60" min="1" max="86400" required
+              />
+            </div>
+          </div>
+
+          <div class="field">
+            <label for="custom_host">Custom Host <span class="optional">optional</span></label>
+            <input
+              id="custom_host" type="text" name="custom_host"
+              placeholder="custom.example.com"
+              spellcheck="false"
+            />
+          </div>
+
+          <button class="btn btn-primary" type="submit" id="submitBtn">
+            <span class="btn-text">Launch</span>
+            <span class="btn-icon">→</span>
+          </button>
+
+          <div id="formError" class="form-error" role="alert" aria-live="polite"></div>
+        </form>
+      </section>
+
+      <!-- Agent status — outside the form -->
+      <section class="panel" aria-label="Agent Status">
+        <div class="panel-label">02 — AGENTS</div>
+        <div class="panel-title-row">
+          <h2 class="panel-title">Agent Status</h2>
+          <div class="agent-badge">
+            <span id="blinkDot" class="blink-dot" aria-hidden="true"></span>
+            <span id="onlineCount">0</span> online
+          </div>
+        </div>
+
+        <div class="scroller" role="region" aria-label="Agent list">
+          <table>
+            <thead>
+              <tr>
+                <th>Agent</th>
+                <th>Status</th>
+                <th>State</th>
+                <th>Last Ping</th>
+              </tr>
+            </thead>
+            <tbody id="agentBody">
+              <tr class="empty-row" id="agentEmptyRow">
+                <td colspan="4">No agents connected</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <!-- Command History -->
+    <section class="panel panel-wide" aria-label="Command History">
+      <div class="panel-label">03 — HISTORY</div>
+      <h2 class="panel-title">Command History</h2>
+
+      <div class="scroller" role="region" aria-label="Command history">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>URL</th>
+              <th>Threads</th>
+              <th>Duration</th>
+              <th>Custom Host</th>
+            </tr>
+          </thead>
+          <tbody id="historyBody">
+            <tr class="empty-row" id="historyEmptyRow">
+              <td colspan="5">No commands sent yet</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <script src="/Interface/main.js"></script>
+</body>
+</html>
