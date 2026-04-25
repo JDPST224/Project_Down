@@ -154,9 +154,9 @@ func (s *Store) collectTargets(ev eventPayload) []*sseClient {
 	var out []*sseClient
 	switch ev.Name {
 	case "command-enqueued":
-		// agent's own listeners + wildcard listeners (browser dashboard, agentID == "")
+		// Route to the agent's own listeners OR the dashboard wildcard (""),
+		// never both — the dashboard gets its own dedicated wildcard event.
 		out = append(out, s.sseByAgent[ev.AgentID]...)
-		out = append(out, s.sseByAgent[""]...)
 	case "agent-status-changed":
 		// agent-specific listeners + wildcard listeners (agentID == "")
 		out = append(out, s.sseByAgent[ev.AgentID]...)
@@ -372,6 +372,10 @@ func (s *Store) handleCommand(events chan<- eventPayload) http.HandlerFunc {
 			for _, ev := range evs {
 				events <- ev
 				slog.Info("enqueued command", "agentID", ev.AgentID, "url", cmd.URL, "threads", cmd.Threads)
+			}
+			// One dedicated event for the dashboard (wildcard agentID "").
+			if len(evs) > 0 {
+				events <- eventPayload{AgentID: "", Name: "command-enqueued", Data: cmd}
 			}
 		}()
 
