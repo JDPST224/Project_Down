@@ -6,5 +6,5 @@ go run agent.go
 ```
 ## Start Control Server
 ```bash
-go run control_server.go
+go run control-server.go
 ```
