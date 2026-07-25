@@ -1,20 +1,3 @@
-// A Go-based HTTP stress-testing tool with improved robustness and performance.
-//
-// Fixes and enhancements over the previous version:
-//   - Encapsulated all global state into a Manager struct (testable, re-entrant).
-//   - Removed deprecated rand.Seed; uses auto-seeded global (Go ≥ 1.20).
-//   - Each worker gets its own *rand.Rand to avoid lock contention on the global source.
-//   - TLS dials use tls.Dialer.DialContext so they respect context cancellation.
-//   - workerLoop re-dials only after sendBurst signals a dead connection (bool return).
-//   - Added exponential backoff on dial failure to avoid CPU-spinning on refused connections.
-//   - bufPool bytes are written directly to conn via WriteTo — no intermediate copy.
-//   - rebalanceCh is a field on Manager, not a package global.
-//   - lookupIPv4 and dnsRefresh are consistent: both treat 0-IP as an error/signal.
-//   - Firefox UA no longer sends sec-ch-ua (Chrome-only header).
-//   - Mixed fmt/log replaced with slog throughout.
-//   - Added atomic request/error counters printed by a stats ticker.
-//   - InsecureSkipVerify annotated with //nolint:gosec.
-//
 // Usage:
 //
 //	go run main.go <URL> <THREADS> <DURATION_SEC> [CUSTOM_HOST]
@@ -49,12 +32,12 @@ type StressConfig struct {
 	CustomHost string
 	Port       int
 	Path       string
+	IsTLS      bool
 }
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
 var (
-	// GET is 3× more likely than POST or HEAD.
 	httpMethods = []string{"GET", "GET", "GET", "POST", "HEAD"}
 
 	contentTypes = []string{
@@ -78,7 +61,6 @@ var (
 // ─── Manager ──────────────────────────────────────────────────────────────────
 
 // Manager coordinates DNS refresh, worker lifecycle, and metrics.
-// All state that was previously package-global lives here.
 type Manager struct {
 	cfg StressConfig
 
@@ -92,6 +74,12 @@ type Manager struct {
 	// Metrics
 	totalReqs   atomic.Int64
 	totalErrors atomic.Int64
+
+	// Latency tracking (total ms)
+	totalLatency atomic.Int64
+
+	// Worker counter for unique RNG seeds
+	workerID atomic.Int64
 }
 
 func NewManager(cfg StressConfig) *Manager {
@@ -162,6 +150,7 @@ func main() {
 		CustomHost: customHost,
 		Port:       determinePort(parsedURL),
 		Path:       path,
+		IsTLS:      parsedURL.Scheme == "https",
 	}
 
 	// Initial DNS lookup.
@@ -291,37 +280,32 @@ func mapCounts(workers map[string][]workerEntry) map[string]int {
 // ─── Worker ───────────────────────────────────────────────────────────────────
 
 func (m *Manager) workerLoop(ctx context.Context, ip string) {
-	// Each worker has its own rand source — no lock contention on the global source.
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	// Unique seed per worker: atomic counter + timestamp for entropy.
+	seed := m.workerID.Add(1) + time.Now().UnixNano()
+	rng := rand.New(rand.NewSource(seed))
 
 	hostHdr := m.cfg.Target.Hostname()
 	if m.cfg.CustomHost != "" {
 		hostHdr = m.cfg.CustomHost
 	}
 
-	//nolint:gosec // InsecureSkipVerify is intentional for a stress tool
-	tlsCfg := &tls.Config{
-		ServerName:         hostHdr,
-		InsecureSkipVerify: true,
-	}
-
 	addr := fmt.Sprintf("%s:%d", ip, m.cfg.Port)
 	backoff := 50 * time.Millisecond
 
+outer:
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 
-		conn, err := dialConn(ctx, addr, tlsCfg)
+		conn, err := dialConn(ctx, addr, m.cfg.IsTLS, hostHdr)
 		if err != nil {
-			// Exponential backoff to avoid CPU spin on refused connections.
 			select {
 			case <-ctx.Done():
 				return
 			case <-time.After(backoff):
 			}
-			backoff = minDuration(backoff*2, 5*time.Second)
+			backoff = min(backoff*2, 5*time.Second)
 			slog.Debug("dial failed", "addr", addr, "err", err, "backoff", backoff)
 			m.totalErrors.Add(1)
 			continue
@@ -330,36 +314,37 @@ func (m *Manager) workerLoop(ctx context.Context, ip string) {
 
 		method := httpMethods[rng.Intn(len(httpMethods))]
 
-		// sendBurst returns false when the connection is dead; re-dial in that case.
+		// sendBurst returns (alive, latency); false means re-dial.
 		for {
 			select {
 			case <-ctx.Done():
 				conn.Close()
 				return
 			default:
-				alive := m.sendBurst(conn, rng, hostHdr, method)
+				alive, latency := m.sendBurst(conn, rng, hostHdr, method)
 				if alive {
 					m.totalReqs.Add(1)
+					m.totalLatency.Add(latency.Milliseconds())
 				} else {
 					m.totalErrors.Add(1)
 					conn.Close()
-					goto redial
+					continue outer
 				}
 			}
 		}
-	redial:
 	}
 }
 
 // ─── Request building & sending ───────────────────────────────────────────────
 
-// sendBurst sends one HTTP request on conn and drains a small response chunk.
-// Returns true if the connection is still usable, false if it should be closed and re-dialled.
-func (m *Manager) sendBurst(conn net.Conn, rng *rand.Rand, hostHdr, method string) (alive bool) {
+// sendBurst sends one HTTP request on conn and drains the response.
+// Returns (alive, latency). alive=false means the connection should be closed and re-dialed.
+func (m *Manager) sendBurst(conn net.Conn, rng *rand.Rand, hostHdr, method string) (alive bool, latency time.Duration) {
 	buf := bufPool.Get().(*bytes.Buffer)
 	buf.Reset()
 
 	var bodyBytes []byte
+	start := time.Now()
 	buildRequest(buf, m.cfg, rng, method, hostHdr, &bodyBytes)
 
 	// Write header (and optional body) directly from pool buffer — no intermediate copy.
@@ -371,17 +356,27 @@ func (m *Manager) sendBurst(conn net.Conn, rng *rand.Rand, hostHdr, method strin
 	bufPool.Put(buf) // safe: buf.Bytes() has already been consumed by WriteTo
 
 	if writeErr != nil {
-		return false
+		return false, 0
 	}
 
-	// Drain a small chunk to advance the OS receive window.
-	// Short deadline so slow servers don't stall the worker.
-	conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
-	var tmp [1024]byte
-	conn.Read(tmp[:]) //nolint:errcheck // intentional drain; errors handled by next write
+	// Drain response in a loop. The read deadline ensures we don't block
+	// forever on a slow server. Set once before the loop so it applies
+	// to all Read calls within.
+	conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	var tmp [4096]byte
+	for {
+		n, err := conn.Read(tmp[:]) //nolint:errcheck // intentional drain
+		if n > 0 {
+			// consumed n bytes of response
+		}
+		if err != nil {
+			break
+		}
+	}
 	conn.SetReadDeadline(time.Time{})
 
-	return true
+	latency = time.Since(start)
+	return true, latency
 }
 
 // buildRequest writes a raw HTTP/1.1 request into buf.
@@ -424,6 +419,8 @@ func buildRequest(buf *bytes.Buffer, cfg StressConfig, rng *rand.Rand, method, h
 		body := createBody(rng, ct)
 		*bodyBytes = body
 		fmt.Fprintf(buf, "Content-Type: %s\r\nContent-Length: %d\r\n", ct, len(body))
+	} else {
+		buf.WriteString("Content-Length: 0\r\n")
 	}
 
 	fmt.Fprintf(buf, "Referer: https://%s/\r\n", hostHdr)
@@ -453,6 +450,7 @@ func (m *Manager) dnsRefresh(ctx context.Context, host string, interval time.Dur
 			select {
 			case m.rebalanceCh <- addrs:
 			default:
+				slog.Debug("DNS update dropped (rebalance busy)", "host", host)
 			}
 		}
 	}
@@ -480,15 +478,19 @@ func lookupIPv4(host string) ([]string, error) {
 
 // ─── Dialling ─────────────────────────────────────────────────────────────────
 
-// dialConn dials addr using a context-aware dialer for both TCP and TLS.
-// TLS uses tls.Dialer.DialContext so the dial respects ctx cancellation.
-func dialConn(ctx context.Context, addr string, tlsCfg *tls.Config) (net.Conn, error) {
+// dialConn dials addr respecting the isTLS flag. For TLS, uses tls.Dialer.DialContext
+// so the dial respects ctx cancellation.
+func dialConn(ctx context.Context, addr string, isTLS bool, serverName string) (net.Conn, error) {
 	netDialer := &net.Dialer{
 		Timeout:   3 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
-	if strings.HasSuffix(addr, ":443") {
-		// tls.Dialer.DialContext honours ctx cancellation, unlike tls.DialWithDialer.
+	if isTLS {
+		//nolint:gosec // InsecureSkipVerify is intentional for a stress tool
+		tlsCfg := &tls.Config{
+			ServerName:         serverName,
+			InsecureSkipVerify: true,
+		}
 		return (&tls.Dialer{NetDialer: netDialer, Config: tlsCfg}).DialContext(ctx, "tcp", addr)
 	}
 	return netDialer.DialContext(ctx, "tcp", addr)
@@ -500,7 +502,7 @@ func (m *Manager) runStats(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	var lastReqs, lastErrs int64
+	var lastReqs, lastErrs, lastLatency int64
 	for {
 		select {
 		case <-ctx.Done():
@@ -508,13 +510,22 @@ func (m *Manager) runStats(ctx context.Context, interval time.Duration) {
 		case <-ticker.C:
 			reqs := m.totalReqs.Load()
 			errs := m.totalErrors.Load()
+			latency := m.totalLatency.Load()
 			deltaReqs := reqs - lastReqs
 			deltaErrs := errs - lastErrs
-			lastReqs, lastErrs = reqs, errs
+			deltaLatency := latency - lastLatency
+			lastReqs, lastErrs, lastLatency = reqs, errs, latency
+
 			rps := float64(deltaReqs) / interval.Seconds()
+			avgLatency := time.Duration(0)
+			if deltaReqs > 0 {
+				avgLatency = time.Duration(deltaLatency / deltaReqs)
+			}
+
 			slog.Info("stats",
 				"req/s", fmt.Sprintf("%.0f", rps),
 				"errors", deltaErrs,
+				"avg_latency", avgLatency,
 				"total_reqs", reqs,
 				"total_errors", errs,
 			)
@@ -546,10 +557,6 @@ func isChromeUA(ua string) bool {
 
 func randomChromeVersion(rng *rand.Rand) string {
 	return strconv.Itoa(rng.Intn(30) + 90)
-}
-
-func randomFirefoxVersion(rng *rand.Rand) string {
-	return strconv.Itoa(rng.Intn(30) + 70)
 }
 
 func randomPlatform(rng *rand.Rand) string {
@@ -623,13 +630,3 @@ func determinePort(u *url.URL) int {
 	}
 	return 80
 }
-
-func minDuration(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// randomFirefoxVersion is kept but only called when building a Firefox UA string.
-var _ = randomFirefoxVersion // suppress "unused" warning — called indirectly via randomUserAgent
