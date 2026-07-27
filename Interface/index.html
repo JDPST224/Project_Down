@@ -5,28 +5,28 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Control Server</title>
+  <meta name="description" content="Distributed agent control panel for managing and monitoring connected agents." />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Syne:wght@400;600;800&display=swap" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Outfit:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/Interface/style.css" />
 </head>
 <body>
-  <div class="grain"></div>
-
   <div class="main-container">
+
+    <!-- ── Header ──────────────────────────────────────────────────────────── -->
     <header class="site-header">
-      <div class="header-eyebrow">SYSTEM CONTROL</div>
       <h1 class="title">Control<span class="title-accent">Server</span></h1>
-      <div class="header-line"></div>
     </header>
 
+    <!-- ── Top grid: Form + Agents ─────────────────────────────────────────── -->
     <div class="top-grid">
-      <!-- Command form — standalone, NOT wrapping the status table -->
-      <section class="panel" aria-label="Send Command">
-        <div class="panel-label">01 — DISPATCH</div>
+
+      <!-- Command form -->
+      <section class="panel panel-primary" aria-label="Send Command">
         <h2 class="panel-title">Send Command</h2>
 
-        <form id="commandForm" autocomplete="off" novalidate>
+        <form id="commandForm" autocomplete="off" novalidate class="panel-body">
           <div class="field">
             <label for="url">Target URL</label>
             <input
@@ -64,49 +64,68 @@
             />
           </div>
 
-          <button class="btn btn-primary" type="submit" id="submitBtn">
-            <span class="btn-text">Launch</span>
-            <span class="btn-icon">→</span>
-          </button>
+          <div class="field">
+            <label for="method">Method</label>
+            <select id="method" name="method" class="form-select">
+              <option value="l7">L7 — Direct</option>
+              <option value="l7p">L7P — Proxy</option>
+            </select>
+          </div>
+
+          <div class="button-group">
+            <button class="btn btn-primary" type="submit" id="submitBtn">
+              <span class="btn-text">Launch</span>
+            </button>
+            <button class="btn btn-danger" type="button" id="stopBtn">
+              <span class="btn-text">Stop All</span>
+            </button>
+          </div>
 
           <div id="formError" class="form-error" role="alert" aria-live="polite"></div>
         </form>
       </section>
 
-      <!-- Agent status — outside the form -->
-      <section class="panel" aria-label="Agent Status">
-        <div class="panel-label">02 — AGENTS</div>
-        <div class="panel-title-row">
-          <h2 class="panel-title">Agent Status</h2>
-          <div class="agent-badge">
-            <span id="blinkDot" class="blink-dot" aria-hidden="true"></span>
-            <span id="onlineCount">0</span> online
+      <!-- Agent Status -->
+      <section class="panel panel-agent" aria-label="Agent Status">
+        <div class="panel-agent-inner">
+          <!-- Title row: label + counter + scrape button -->
+          <div class="panel-title-row">
+            <h2 class="panel-title">Agent Status</h2>
+            <div class="panel-title-actions">
+              <span class="agent-counter" id="agentCounter">
+                <span class="blink-dot" id="blinkDot" aria-hidden="true"></span>
+                <span id="onlineCount">0</span> Online
+              </span>
+              <button class="btn-scrape" id="scrapeProxiesBtn" title="Scrape public proxy lists">
+                <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+                Proxies
+              </button>
+            </div>
           </div>
-        </div>
 
-        <div class="scroller" role="region" aria-label="Agent list">
-          <table>
-            <thead>
-              <tr>
-                <th>Agent</th>
-                <th>Status</th>
-                <th>State</th>
-                <th>Last Ping</th>
-              </tr>
-            </thead>
-            <tbody id="agentBody">
-              <tr class="empty-row" id="agentEmptyRow">
-                <td colspan="4">No agents connected</td>
-              </tr>
-            </tbody>
-          </table>
+          <div class="agent-scroller panel-body" role="region" aria-label="Agent list">
+            <table>
+              <thead>
+                <tr>
+                  <th>Agent</th>
+                  <th>Status</th>
+                  <th>State</th>
+                  <th>Last Ping</th>
+                </tr>
+              </thead>
+              <tbody id="agentBody">
+                <tr class="empty-row" id="agentEmptyRow">
+                  <td colspan="4">No agents connected</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </section>
     </div>
 
-    <!-- Command History -->
+    <!-- ── Command History ─────────────────────────────────────────────────── -->
     <section class="panel panel-wide" aria-label="Command History">
-      <div class="panel-label">03 — HISTORY</div>
       <h2 class="panel-title">Command History</h2>
 
       <div class="scroller" role="region" aria-label="Command history">
@@ -114,6 +133,7 @@
           <thead>
             <tr>
               <th>Time</th>
+              <th>Method</th>
               <th>URL</th>
               <th>Threads</th>
               <th>Duration</th>
@@ -122,14 +142,71 @@
           </thead>
           <tbody id="historyBody">
             <tr class="empty-row" id="historyEmptyRow">
-              <td colspan="5">No commands sent yet</td>
+              <td colspan="6">No commands sent yet</td>
             </tr>
           </tbody>
         </table>
       </div>
     </section>
-  </div>
+
+  </div><!-- /.main-container -->
 
   <script src="/Interface/main.js"></script>
+
+  <!-- ── Proxy Scraper Modal ─────────────────────────────────────────────── -->
+  <div class="modal-overlay" id="proxyModal" aria-modal="true" role="dialog" aria-label="Proxy Scraper" hidden>
+    <div class="modal">
+      <div class="modal-header">
+        <div>
+          <div class="modal-eyebrow">TOOL</div>
+          <h3 class="modal-title">Proxy Scraper</h3>
+        </div>
+        <button class="modal-close" id="proxyModalClose" aria-label="Close">&times;</button>
+      </div>
+
+      <!-- Toolbar: protocol selector + action buttons -->
+      <div class="modal-toolbar">
+        <div class="proxy-protocol-wrap">
+          <label for="proxyProtocol" class="proxy-protocol-label">Protocol</label>
+          <select id="proxyProtocol" class="proxy-protocol-select">
+            <option value="http">HTTP</option>
+            <option value="https">HTTPS</option>
+            <option value="socks4">SOCKS4</option>
+            <option value="socks5">SOCKS5</option>
+          </select>
+        </div>
+        <div class="modal-toolbar-btns">
+          <button class="btn-scrape" id="modalScrapeBtn">↻ Scrape</button>
+          <button class="btn btn-sm" id="clearProxiesBtn" disabled>Clear</button>
+          <div class="proxy-protocol-wrap">
+            <label for="testTimeoutMs" class="proxy-protocol-label">Timeout (ms)</label>
+            <input type="number" id="testTimeoutMs" value="3000" min="500" max="15000" step="500" class="proxy-protocol-select timeout-input" title="Dial timeout in milliseconds" />
+          </div>
+          <button class="btn btn-sm btn-test" id="testProxiesBtn" disabled>Test Proxies</button>
+        </div>
+      </div>
+
+      <!-- Meta: count badge + copy/download -->
+      <div class="modal-meta">
+        <div class="proxy-meta-info">
+          <span class="proxy-badge" id="proxyCountBadge">—</span>
+          <div class="proxy-test-progress-container" id="proxyTestProgress" hidden>
+            <div class="proxy-test-progress-fill" id="proxyTestProgressFill"></div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-sm btn-send" id="sendProxiesBtn" disabled>Send to Agents</button>
+          <button class="btn btn-sm" id="copyProxiesBtn" disabled>Copy All</button>
+          <button class="btn btn-sm" id="downloadProxiesBtn" disabled>Download .txt</button>
+        </div>
+      </div>
+
+      <div class="proxy-list-wrap" id="proxyListWrap">
+        <div class="proxy-placeholder" id="proxyPlaceholder">Select a protocol and click ↻ Scrape.</div>
+        <div class="proxy-list" id="proxyList"></div>
+      </div>
+    </div>
+  </div>
+
 </body>
 </html>
