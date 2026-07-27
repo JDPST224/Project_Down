@@ -1,4 +1,3 @@
-// control_server.go
 package main
 
 import (
