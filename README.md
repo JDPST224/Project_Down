@@ -1,7 +1,7 @@
 ## Start Agent
 ```bash
 ulimit -n 999999
-go build l7.go
+go build -o l7 ./tool
 go run agent.go
 ```
 ## Start Control Server
