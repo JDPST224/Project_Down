@@ -180,6 +180,9 @@ document.addEventListener("DOMContentLoaded", () => {
     clearFormError();
 
     const formData = new FormData(form);
+    if (formData.get("method") !== "l7p") {
+      formData.delete("proxy_type");
+    }
 
     // Client-side validation beyond HTML attributes.
     const rawURL = (formData.get("url") || "").trim();
@@ -213,6 +216,9 @@ document.addEventListener("DOMContentLoaded", () => {
       // The SSE "command-enqueued" event will fire and add the history row.
       // We do NOT add it here too — that would cause duplicate rows.
       form.reset();
+      if (methodSelect) {
+        methodSelect.dispatchEvent(new Event("change"));
+      }
     } catch (err) {
       showFormError(err.message);
     } finally {
