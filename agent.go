@@ -35,6 +35,7 @@ type Command struct {
 	Timer      int      `json:"timer"`
 	CustomHost string   `json:"custom_host"`
 	Method     string   `json:"method"`
+	ProxyType  string   `json:"proxy_type,omitempty"`
 	Proxies    []string `json:"proxies,omitempty"`
 }
 
