@@ -58,7 +58,7 @@ func (m *ProxyManager) snapshotProxies() []string {
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
-func runProxy(rawURL string, threads int, duration time.Duration, proxyType string, customHost string) {
+func runProxy(rawURL string, threads int, duration time.Duration, proxyType string, customHost string, jitterMs int) {
 	parsedURL, err := url.Parse(rawURL)
 	if err != nil || parsedURL.Scheme == "" || parsedURL.Hostname() == "" {
 		fmt.Fprintf(os.Stderr, "Invalid URL: %q\n", rawURL)
@@ -95,6 +95,7 @@ func runProxy(rawURL string, threads int, duration time.Duration, proxyType stri
 		Path:       path,
 		ProxyType:  proxyType,
 		Proxies:    proxies,
+		JitterMs:   jitterMs,
 	}
 
 	mgr := NewProxyManager(cfg)
@@ -181,13 +182,6 @@ func (m *ProxyManager) proxyWorkerLoop(ctx context.Context, proxyIdx int) {
 
 	backoff := 50 * time.Millisecond
 
-	// Shared TLS config for the target (used after CONNECT or SOCKS tunnel).
-	//nolint:gosec // InsecureSkipVerify is intentional for a stress tool
-	targetTLS := &tls.Config{
-		ServerName:         hostHdr,
-		InsecureSkipVerify: true,
-	}
-
 	for {
 		if ctx.Err() != nil {
 			return
@@ -205,6 +199,15 @@ func (m *ProxyManager) proxyWorkerLoop(ctx context.Context, proxyIdx int) {
 			continue
 		}
 		proxyAddr := proxies[proxyIdx%len(proxies)]
+
+		// Fresh TLS config per-dial to shuffle cipher suites (JA3 variation).
+		//nolint:gosec // InsecureSkipVerify is intentional for a stress tool
+		targetTLS := &tls.Config{
+			ServerName:         hostHdr,
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS12,
+			CipherSuites:       shuffledCipherSuites(),
+		}
 
 		conn, err := dialViaProxy(ctx, proxyAddr, m.cfg, targetTLS)
 		if err != nil {
@@ -234,6 +237,16 @@ func (m *ProxyManager) proxyWorkerLoop(ctx context.Context, proxyIdx int) {
 				alive := m.proxySendBurst(conn, hostHdr, method)
 				if alive {
 					m.totalReqs.Add(1)
+					// Jitter: small random sleep to avoid zero-delay bot signature.
+					if m.cfg.JitterMs > 0 {
+						jitter := time.Duration(rand.IntN(m.cfg.JitterMs)+1) * time.Millisecond
+						select {
+						case <-ctx.Done():
+							conn.Close()
+							return
+						case <-time.After(jitter):
+						}
+					}
 				} else {
 					m.totalErrors.Add(1)
 					conn.Close()

