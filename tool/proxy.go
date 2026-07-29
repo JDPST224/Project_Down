@@ -13,7 +13,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"net/url"
 	"os"
@@ -174,8 +174,6 @@ func (m *ProxyManager) runProxyManager(ctx context.Context) {
 // ─── Proxy Worker ─────────────────────────────────────────────────────────────
 
 func (m *ProxyManager) proxyWorkerLoop(ctx context.Context, proxyIdx int) {
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-
 	hostHdr := m.cfg.Target.Hostname()
 	if m.cfg.CustomHost != "" {
 		hostHdr = m.cfg.CustomHost
@@ -224,7 +222,7 @@ func (m *ProxyManager) proxyWorkerLoop(ctx context.Context, proxyIdx int) {
 		}
 		backoff = 50 * time.Millisecond // reset on successful dial
 
-		method := httpMethods[rng.Intn(len(httpMethods))]
+		method := httpMethods[rand.IntN(len(httpMethods))]
 
 	burstLoop:
 		for {
@@ -233,7 +231,7 @@ func (m *ProxyManager) proxyWorkerLoop(ctx context.Context, proxyIdx int) {
 				conn.Close()
 				return
 			default:
-				alive := m.proxySendBurst(conn, rng, hostHdr, method)
+				alive := m.proxySendBurst(conn, hostHdr, method)
 				if alive {
 					m.totalReqs.Add(1)
 				} else {
@@ -469,20 +467,29 @@ func dialSOCKS5(ctx context.Context, proxyAddr string, cfg StressConfig, targetT
 
 // proxySendBurst sends one HTTP request on conn and drains a small response chunk.
 // Returns true if the connection is still usable, false if it should be closed and re-dialled.
-func (m *ProxyManager) proxySendBurst(conn net.Conn, rng *rand.Rand, hostHdr, method string) (alive bool) {
+func (m *ProxyManager) proxySendBurst(conn net.Conn, hostHdr, method string) (alive bool) {
 	buf := bufPool.Get().(*bytes.Buffer)
 	buf.Reset()
 
-	var bodyBytes []byte
-	buildRequest(buf, m.cfg, rng, method, hostHdr, &bodyBytes)
+	var bodyBuf *bytes.Buffer
+	if method == "POST" {
+		bodyBuf = bodyBufPool.Get().(*bytes.Buffer)
+		bodyBuf.Reset()
+	}
+
+	buildRequest(buf, m.cfg, method, hostHdr, bodyBuf)
 
 	// Write header (and optional body) directly from pool buffer — no intermediate copy.
 	bufs := net.Buffers{buf.Bytes()}
-	if method == "POST" && len(bodyBytes) > 0 {
-		bufs = append(bufs, bodyBytes)
+	if method == "POST" && bodyBuf != nil && bodyBuf.Len() > 0 {
+		bufs = append(bufs, bodyBuf.Bytes())
 	}
 	_, writeErr := bufs.WriteTo(conn)
+	
 	bufPool.Put(buf) // safe: buf.Bytes() has already been consumed by WriteTo
+	if bodyBuf != nil {
+		bodyBufPool.Put(bodyBuf)
+	}
 
 	if writeErr != nil {
 		return false
