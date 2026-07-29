@@ -583,6 +583,7 @@ func renderInterface(w http.ResponseWriter, r *http.Request) {
 var proxySourcesByProtocol = map[string][]string{
 	"http": {
 		"https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
+		"https://raw.githubusercontent.com/iplocate/free-proxy-list/refs/heads/main/protocols/http.txt",
 		"https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
 		"https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
 		"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
@@ -590,18 +591,21 @@ var proxySourcesByProtocol = map[string][]string{
 	},
 	"https": {
 		"https://api.proxyscrape.com/v2/?request=displayproxies&protocol=https&timeout=10000&country=all&ssl=all&anonymity=all",
+		"https://raw.githubusercontent.com/iplocate/free-proxy-list/refs/heads/main/protocols/https.txt",
 		"https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/https.txt",
 		"https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/https.txt",
 		"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/https.txt",
 	},
 	"socks4": {
 		"https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4&timeout=10000&country=all",
+		"https://raw.githubusercontent.com/iplocate/free-proxy-list/refs/heads/main/protocols/socks4.txt",
 		"https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
 		"https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks4.txt",
 		"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
 	},
 	"socks5": {
 		"https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all",
+		"https://raw.githubusercontent.com/iplocate/free-proxy-list/refs/heads/main/protocols/socks5.txt",
 		"https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
 		"https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
 		"https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
